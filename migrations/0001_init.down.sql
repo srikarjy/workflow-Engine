@@ -1,1 +1,2 @@
--- revert init schema
+DROP TABLE IF EXISTS events;
+DROP TABLE IF EXISTS workflows;
