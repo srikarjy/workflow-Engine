@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/srikarjy/workflow_engine/internal/faultinject"
 	"github.com/srikarjy/workflow_engine/internal/idempotency"
 	"github.com/srikarjy/workflow_engine/internal/store"
 )
@@ -56,7 +57,8 @@ func (p *CompensationPlan) Steps() []ExecutedStep {
 // ExecuteCompensation runs compensation for all steps in reverse order.
 // Each compensation step is recorded in the event log for crash recovery.
 func (p *CompensationPlan) ExecuteCompensation(ctx context.Context, s *store.Store, workflowID uuid.UUID) error {
-	for _, step := range p.Steps() {
+	steps := p.Steps()
+	for i, step := range steps {
 		compDedupKey, err := idempotency.DedupKey(workflowID.String(), "compensate_"+step.Name, step.Output)
 		if err != nil {
 			return err
@@ -82,6 +84,12 @@ func (p *CompensationPlan) ExecuteCompensation(ctx context.Context, s *store.Sto
 				continue
 			}
 			return err
+		}
+
+		if i == len(steps)-1 {
+			faultinject.Crash("during_final_compensation")
+		} else {
+			faultinject.Crash("during_compensation")
 		}
 
 		_, err = s.AppendEvent(ctx, store.Event{

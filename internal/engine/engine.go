@@ -7,14 +7,48 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/google/uuid"
 
+	"github.com/srikarjy/workflow_engine/internal/faultinject"
 	"github.com/srikarjy/workflow_engine/internal/idempotency"
 	"github.com/srikarjy/workflow_engine/internal/queue"
 	"github.com/srikarjy/workflow_engine/internal/saga"
 	"github.com/srikarjy/workflow_engine/internal/store"
 )
+
+// ErrStepNotRegistered is returned when a queue-dispatched step name has no
+// corresponding executor in the engine's registry.
+var ErrStepNotRegistered = errors.New("engine: step not registered")
+
+// StepRegistry resolves step names to their executors. Queue messages carry
+// only a step name (they cross a Redis stream as JSON), so a worker process
+// needs this lookup to find the business logic to run for ProcessStep.
+type StepRegistry struct {
+	mu    sync.RWMutex
+	steps map[string]StepExecutor
+}
+
+// NewStepRegistry creates an empty step registry.
+func NewStepRegistry() *StepRegistry {
+	return &StepRegistry{steps: make(map[string]StepExecutor)}
+}
+
+// Register adds a step executor under its own Name().
+func (r *StepRegistry) Register(step StepExecutor) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.steps[step.Name()] = step
+}
+
+// Get looks up a step executor by name.
+func (r *StepRegistry) Get(name string) (StepExecutor, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	step, ok := r.steps[name]
+	return step, ok
+}
 
 // StepExecutor defines the interface for executing a workflow step.
 type StepExecutor interface {
@@ -31,25 +65,36 @@ type WorkflowDefinition struct {
 
 // Engine coordinates workflow execution with exactly-once guarantees.
 type Engine struct {
-	store   *store.Store
-	queue   *queue.Client
+	store    *store.Store
+	queue    *queue.Client
 	workerID string
+	registry *StepRegistry
 }
 
-// NewEngine creates a new workflow engine.
-func NewEngine(store *store.Store, queue *queue.Client, workerID string) *Engine {
+// NewEngine creates a new workflow engine. registry resolves step names for
+// queue-dispatched messages processed via ProcessStep; pass NewStepRegistry()
+// with the relevant steps registered, or nil if the engine is only used via
+// ExecuteWorkflow (which carries its own StepExecutor instances directly).
+func NewEngine(store *store.Store, queue *queue.Client, workerID string, registry *StepRegistry) *Engine {
+	if registry == nil {
+		registry = NewStepRegistry()
+	}
 	return &Engine{
 		store:    store,
 		queue:    queue,
 		workerID: workerID,
+		registry: registry,
 	}
 }
 
-// ExecuteWorkflow runs a workflow to completion with crash recovery.
-func (e *Engine) ExecuteWorkflow(ctx context.Context, wfDef *WorkflowDefinition, input map[string]any) (uuid.UUID, error) {
-	wfID := uuid.New()
-
-	// Create workflow record
+// ExecuteWorkflow runs a workflow to completion with crash recovery. wfID
+// identifies the workflow: pass uuid.New() to start a fresh run, or a
+// previously used ID to resume one that crashed mid-flight — CreateWorkflow
+// is idempotent, and every step (forward and compensating) below is gated
+// on the event log, so steps already recorded as complete are skipped
+// rather than re-run.
+func (e *Engine) ExecuteWorkflow(ctx context.Context, wfID uuid.UUID, wfDef *WorkflowDefinition, input map[string]any) (uuid.UUID, error) {
+	// Create workflow record (idempotent: a resumed run reuses the same ID)
 	if err := e.store.CreateWorkflow(ctx, wfID, wfDef.Name, mustMarshal(input)); err != nil {
 		return uuid.Nil, fmt.Errorf("engine: create workflow: %w", err)
 	}
@@ -156,6 +201,11 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, wfDef *WorkflowDefinition,
 }
 
 // ProcessStep pulls a step from the queue and executes it (worker mode).
+// It follows the same exactly-once sequence as ExecuteWorkflow: check for a
+// prior completion, record that execution started, run the step's business
+// logic via the registry, then record completion. The unique index on
+// dedup_key for completion events (see migrations/0001_init.up.sql) is what
+// makes a race between two workers processing the same message safe.
 func (e *Engine) ProcessStep(ctx context.Context, msg queue.StepMessage) error {
 	dedupKey := msg.DedupKey
 	if dedupKey == "" {
@@ -180,16 +230,56 @@ func (e *Engine) ProcessStep(ctx context.Context, msg queue.StepMessage) error {
 		return err
 	}
 
-	// This would look up the step executor from a registry
-	// For now, we just record completion
+	step, ok := e.registry.Get(msg.StepName)
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrStepNotRegistered, msg.StepName)
+	}
+
+	_, err = e.store.AppendEvent(ctx, store.Event{
+		WorkflowID: wfID,
+		StepName:   msg.StepName,
+		Type:       store.EventStepStarted,
+		DedupKey:   dedupKey,
+		Payload:    mustMarshal(msg.Input),
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrDuplicateEvent) {
+			// Should not happen for step_started (no unique constraint on
+			// it), but treat as already-handled defensively.
+			return nil
+		}
+		return fmt.Errorf("engine: record step started: %w", err)
+	}
+
+	faultinject.Crash("before_execution")
+
+	output, execErr := step.Execute(ctx, msg.Input)
+	if execErr != nil {
+		_, _ = e.store.AppendEvent(ctx, store.Event{
+			WorkflowID: wfID,
+			StepName:   msg.StepName,
+			Type:       store.EventStepFailed,
+			DedupKey:   dedupKey,
+			Payload:    mustMarshal(map[string]any{"error": execErr.Error()}),
+		})
+		return fmt.Errorf("engine: execute step %s: %w", msg.StepName, execErr)
+	}
+
+	faultinject.Crash("after_completion_before_log")
+
 	_, err = e.store.AppendEvent(ctx, store.Event{
 		WorkflowID: wfID,
 		StepName:   msg.StepName,
 		Type:       store.EventStepCompleted,
 		DedupKey:   dedupKey,
-		Payload:    mustMarshal(map[string]any{"status": "completed", "worker": e.workerID}),
+		Payload:    mustMarshal(output),
 	})
-	return err
+	if err != nil && !errors.Is(err, store.ErrDuplicateEvent) {
+		return fmt.Errorf("engine: record step completed: %w", err)
+	}
+
+	log.Printf("worker %s: step %s completed (dedup: %s)", e.workerID, msg.StepName, dedupKey)
+	return nil
 }
 
 // RecoverWorkflow replays a workflow's event log to reconstruct state.

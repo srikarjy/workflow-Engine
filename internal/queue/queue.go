@@ -95,8 +95,34 @@ func (c *Client) Claim(ctx context.Context, consumer string, minIdleTime time.Du
 		Stream:   c.stream,
 		Group:    c.group,
 		Consumer: consumer,
+		MinIdle:  minIdleTime,
 		Messages: msgIDs,
 	}).Result()
+}
+
+// ReclaimPending transfers ownership of any message that has been pending
+// (delivered but unacked) for at least minIdle to consumer, and returns
+// them for (re)processing. This is how a replacement worker picks up a
+// message whose original consumer crashed before acking it: XREADGROUP with
+// ">" only ever delivers messages nobody has claimed yet, so without this a
+// crashed consumer's in-flight message would sit in the group's pending
+// entries list forever.
+func (c *Client) ReclaimPending(ctx context.Context, consumer string, minIdle time.Duration) ([]redis.XMessage, error) {
+	pending, err := c.Pending(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var ids []string
+	for _, p := range pending {
+		if p.Idle >= minIdle {
+			ids = append(ids, p.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return c.Claim(ctx, consumer, minIdle, ids...)
 }
 
 // ParseStepMessage parses a StepMessage from a Redis stream message.

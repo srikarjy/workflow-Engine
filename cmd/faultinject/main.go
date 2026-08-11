@@ -1,4 +1,13 @@
-// Command faultinject crashes workers with SIGKILL at various execution points.
+// Command faultinject crashes workers with SIGKILL at various execution
+// points and verifies exactly-once behavior across the crash.
+//
+// Each injection point corresponds to a checkpoint the worker process
+// itself calls via internal/faultinject.Crash: when the FAULT_INJECT
+// environment variable matches the checkpoint name, the worker
+// self-terminates with SIGKILL at that exact point in its own code, rather
+// than being killed from outside after a guessed delay. That makes the
+// crash timing deterministic and precisely synchronized with the code path
+// under test.
 package main
 
 import (
@@ -42,6 +51,24 @@ var injectionNames = []string{
 	"During final compensation step",
 }
 
+// injectionEnvKeys are the FAULT_INJECT values internal/faultinject.Crash
+// checks for at each corresponding checkpoint in the engine/saga/steps
+// packages. Index-aligned with the injectionPoint constants above.
+var injectionEnvKeys = []string{
+	"before_execution",
+	"during_execution",
+	"after_completion_before_log",
+	"after_log_before_ack",
+	"during_compensation",
+	"during_final_compensation",
+}
+
+// crashWaitTimeout bounds how long we wait for a worker to reach its
+// checkpoint and self-crash. The checkpoint fires almost immediately once
+// the code path is reached, so this is a generous safety net for a
+// misconfigured run (e.g. checkpoint never reached), not the normal case.
+const crashWaitTimeout = 10 * time.Second
+
 type testResult struct {
 	injectionPoint injectionPoint
 	run            int
@@ -56,7 +83,7 @@ func main() {
 		postgresDSN  = flag.String("postgres", "postgres://postgres:postgres@localhost:5432/workflow", "PostgreSQL DSN")
 		redisAddr    = flag.String("redis", "localhost:6379", "Redis address")
 		runsPerPoint = flag.Int("runs", 80, "Runs per injection point (total = runs * 6)")
-		streamName   = flag.String("stream", "workflow-steps", "Redis stream name")
+		streamName   = flag.String("stream", "workflow-steps", "Redis stream name prefix (each run gets its own stream)")
 		groupName    = flag.String("group", "workers", "Consumer group name")
 		workerPath   = flag.String("worker", "./worker", "Path to worker binary")
 	)
@@ -127,11 +154,15 @@ func main() {
 	}
 }
 
-func runInjectionTest(ip injectionPoint, run int, postgresDSN, redisAddr, streamName, groupName, workerPath string) testResult {
+func runInjectionTest(ip injectionPoint, run int, postgresDSN, redisAddr, baseStream, groupName, workerPath string) testResult {
 	start := time.Now()
-	ctx := context.Background()
 
-	testID := fmt.Sprintf("fault-%s-%d", injectionNames[ip], run)
+	if ip == DuringCompensation || ip == DuringFinalCompensation {
+		return runCompensationInjectionTest(ip, run, postgresDSN, workerPath, start)
+	}
+
+	ctx := context.Background()
+	testID := fmt.Sprintf("%s-%d-%d", injectionEnvKeys[ip], run, time.Now().UnixNano())
 	wfID := uuid.New()
 
 	pool, err := pgxpool.New(ctx, postgresDSN)
@@ -151,6 +182,9 @@ func runInjectionTest(ip injectionPoint, run int, postgresDSN, redisAddr, stream
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer rdb.Close()
 
+	// Each test gets its own stream so concurrent runs can never steal one
+	// another's queued step message.
+	streamName := baseStream + "-" + testID
 	q := queue.NewClient(rdb, streamName, groupName)
 	if err := q.EnsureGroup(ctx); err != nil {
 		log.Printf("Test %s: failed to ensure group: %v", testID, err)
@@ -162,7 +196,10 @@ func runInjectionTest(ip injectionPoint, run int, postgresDSN, redisAddr, stream
 		return testResult{injectionPoint: ip, run: run, passed: false}
 	}
 
-	stepName := "test_step"
+	// reserve_inventory is one of the demo steps cmd/worker always
+	// registers (internal/steps.OrderSagaSteps), so ProcessStep can
+	// actually resolve and execute it.
+	stepName := "reserve_inventory"
 	dedupKey, _ := idempotency.DedupKey(wfID.String(), stepName, map[string]any{"data": "test"})
 	msg := queue.StepMessage{
 		WorkflowID: wfID.String(),
@@ -184,34 +221,19 @@ func runInjectionTest(ip injectionPoint, run int, postgresDSN, redisAddr, stream
 		"-worker-id", workerID,
 		"-workers", "1",
 	)
-
-	switch ip {
-	case BeforeExecution:
-		cmd.Env = append(os.Environ(), "FAULT_INJECT=before_execution", "FAULT_SIGNAL=SIGKILL")
-	case DuringExecution:
-		cmd.Env = append(os.Environ(), "FAULT_INJECT=during_execution", "FAULT_SIGNAL=SIGKILL")
-	case AfterCompletionBeforeEventLog:
-		cmd.Env = append(os.Environ(), "FAULT_INJECT=after_completion_before_log", "FAULT_SIGNAL=SIGKILL")
-	case AfterEventLogBeforeAck:
-		cmd.Env = append(os.Environ(), "FAULT_INJECT=after_log_before_ack", "FAULT_SIGNAL=SIGKILL")
-	case DuringCompensation:
-		cmd.Env = append(os.Environ(), "FAULT_INJECT=during_compensation", "FAULT_SIGNAL=SIGKILL")
-	case DuringFinalCompensation:
-		cmd.Env = append(os.Environ(), "FAULT_INJECT=during_final_compensation", "FAULT_SIGNAL=SIGKILL")
-	}
+	cmd.Env = append(os.Environ(), "FAULT_INJECT="+injectionEnvKeys[ip])
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("Test %s: failed to start worker: %v", testID, err)
 		return testResult{injectionPoint: ip, run: run, passed: false}
 	}
-
-	time.Sleep(2 * time.Second)
-
-	if err := cmd.Process.Kill(); err != nil {
-		log.Printf("Test %s: failed to kill worker: %v", testID, err)
+	if !waitForExit(cmd, crashWaitTimeout) {
+		log.Printf("Test %s: worker did not self-crash within %s (checkpoint never reached)", testID, crashWaitTimeout)
 	}
-	cmd.Wait()
 
+	// Replacement worker: no FAULT_INJECT, reclaims the message the crashed
+	// worker left pending (reclaim-idle=0 so it doesn't have to wait out the
+	// default idle threshold) and drives it to completion.
 	replacementID := workerID + "-replacement"
 	cmd2 := exec.Command(workerPath,
 		"-postgres", postgresDSN,
@@ -220,39 +242,130 @@ func runInjectionTest(ip injectionPoint, run int, postgresDSN, redisAddr, stream
 		"-group", groupName,
 		"-worker-id", replacementID,
 		"-workers", "1",
+		"-reclaim-idle", "0s",
 	)
-
 	if err := cmd2.Start(); err != nil {
 		log.Printf("Test %s: failed to start replacement worker: %v", testID, err)
 		return testResult{injectionPoint: ip, run: run, passed: false}
 	}
-
 	time.Sleep(3 * time.Second)
-	cmd2.Process.Kill()
-	cmd2.Wait()
+	_ = cmd2.Process.Kill()
+	_ = cmd2.Wait()
 
 	var completionCount int
 	err = pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM events
 		WHERE workflow_id = $1 AND step_name = $2 AND event_type = 'step_completed'
 	`, wfID, stepName).Scan(&completionCount)
+	if err != nil {
+		log.Printf("Test %s: failed to count completions: %v", testID, err)
+		return testResult{injectionPoint: ip, run: run, passed: false}
+	}
 
 	doubleExec := completionCount > 1
 	lostStep := completionCount == 0
 
-	passed := !doubleExec && !lostStep
-
 	return testResult{
 		injectionPoint: ip,
 		run:            run,
-		passed:         passed,
+		passed:         !doubleExec && !lostStep,
 		doubleExec:     doubleExec,
 		lostStep:       lostStep,
 		duration:       time.Since(start),
 	}
 }
 
+// runCompensationInjectionTest exercises the Saga rollback path: it runs a
+// fixed workflow (two steps succeed, the third always fails) through
+// worker's -fault-saga mode against a specific wfID, which forces
+// compensation of the two successful steps. FAULT_INJECT makes that first
+// run self-crash mid-compensation; a second run against the same wfID (no
+// FAULT_INJECT) resumes and finishes it.
+func runCompensationInjectionTest(ip injectionPoint, run int, postgresDSN, workerPath string, start time.Time) testResult {
+	ctx := context.Background()
+	wfID := uuid.New()
+	testID := wfID.String()
+
+	pool, err := pgxpool.New(ctx, postgresDSN)
+	if err != nil {
+		log.Printf("Test %s: failed to connect to DB: %v", testID, err)
+		return testResult{injectionPoint: ip, run: run, passed: false}
+	}
+	defer pool.Close()
+
+	cmd := exec.Command(workerPath, "-postgres", postgresDSN, "-fault-saga", "-wf-id", wfID.String())
+	cmd.Env = append(os.Environ(), "FAULT_INJECT="+injectionEnvKeys[ip])
+	if err := cmd.Start(); err != nil {
+		log.Printf("Test %s: failed to start fault-saga worker: %v", testID, err)
+		return testResult{injectionPoint: ip, run: run, passed: false}
+	}
+	if !waitForExit(cmd, crashWaitTimeout) {
+		log.Printf("Test %s: worker did not self-crash within %s (checkpoint never reached)", testID, crashWaitTimeout)
+	}
+
+	// Replacement run against the same wfID resumes compensation:
+	// CreateWorkflow is idempotent and every step/compensation is gated on
+	// the event log, so already-completed work is skipped.
+	cmd2 := exec.Command(workerPath, "-postgres", postgresDSN, "-fault-saga", "-wf-id", wfID.String())
+	if err := cmd2.Run(); err != nil {
+		log.Printf("Test %s: replacement fault-saga run error: %v", testID, err)
+	}
+
+	// The workflow is reserve_inventory -> charge_payment -> (fails), so
+	// compensation runs in reverse: compensate_charge_payment first (the
+	// "during compensation" checkpoint), compensate_reserve_inventory last
+	// (the "during final compensation" checkpoint).
+	compStepName := "compensate_reserve_inventory"
+	if ip == DuringCompensation {
+		compStepName = "compensate_charge_payment"
+	}
+
+	var completionCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM events
+		WHERE workflow_id = $1 AND step_name = $2 AND event_type = 'compensation_completed'
+	`, wfID, compStepName).Scan(&completionCount)
+	if err != nil {
+		log.Printf("Test %s: failed to count compensation completions: %v", testID, err)
+		return testResult{injectionPoint: ip, run: run, passed: false}
+	}
+
+	doubleExec := completionCount > 1
+	lostStep := completionCount == 0
+
+	return testResult{
+		injectionPoint: ip,
+		run:            run,
+		passed:         !doubleExec && !lostStep,
+		doubleExec:     doubleExec,
+		lostStep:       lostStep,
+		duration:       time.Since(start),
+	}
+}
+
+// waitForExit waits for cmd to exit on its own (the expected outcome: it hit
+// its FAULT_INJECT checkpoint and self-SIGKILLed). It returns false and
+// force-kills the process if that doesn't happen within timeout.
+func waitForExit(cmd *exec.Cmd, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		<-done
+		return false
+	}
+}
+
 func mustMarshal(v any) []byte {
-	data, _ := json.Marshal(v)
+	data, err := json.Marshal(v)
+	if err != nil {
+		return []byte("{}")
+	}
 	return data
 }

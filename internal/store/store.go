@@ -84,6 +84,9 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 
+// CreateWorkflow inserts a new workflow row. It is idempotent on id: a
+// resumed run after a crash reuses the same workflow ID, and re-inserting it
+// is a no-op rather than a primary-key error.
 func (s *Store) CreateWorkflow(ctx context.Context, id uuid.UUID, name string, input json.RawMessage) error {
 	if input == nil {
 		input = json.RawMessage("{}")
@@ -91,6 +94,7 @@ func (s *Store) CreateWorkflow(ctx context.Context, id uuid.UUID, name string, i
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO workflows (id, name, status, input)
 		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (id) DO NOTHING
 	`, id, name, StatusRunning, input)
 	return err
 }
