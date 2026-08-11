@@ -37,6 +37,17 @@ const (
 	StatusFailed       WorkflowStatus = "failed"
 )
 
+// EventLog is the subset of *Store that Engine and Saga depend on. It exists
+// so their logic can be unit tested against a fast in-memory fake instead of
+// requiring a live PostgreSQL connection for every test; *Store satisfies it.
+type EventLog interface {
+	CreateWorkflow(ctx context.Context, id uuid.UUID, name string, input json.RawMessage) error
+	UpdateWorkflowStatus(ctx context.Context, id uuid.UUID, status WorkflowStatus) error
+	AppendEvent(ctx context.Context, e Event) (Event, error)
+	HasCompleted(ctx context.Context, dedupKey string) (bool, error)
+	ReplayEvents(ctx context.Context, workflowID uuid.UUID) ([]Event, error)
+}
+
 // ErrDuplicateEvent is returned by AppendEvent when a completion event with
 // the same dedup key has already been committed by another worker. Callers
 // treat this as "already done" rather than an error.

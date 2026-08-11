@@ -33,7 +33,7 @@ func main() {
 		},
 	}
 
-	rootCmd.PersistentFlags().StringVar(&postgresDSN, "postgres", "postgres://postgres:postgres@localhost:5432/workflow", "PostgreSQL DSN")
+	rootCmd.PersistentFlags().StringVar(&postgresDSN, "postgres", "postgres://workflow:workflow@localhost:15432/workflow?sslmode=disable", "PostgreSQL DSN")
 
 	var createCmd = &cobra.Command{
 		Use:   "create",

@@ -59,13 +59,13 @@ type StepExecutor interface {
 
 // WorkflowDefinition defines a workflow as a sequence of steps.
 type WorkflowDefinition struct {
-	Name string
+	Name  string
 	Steps []StepExecutor
 }
 
 // Engine coordinates workflow execution with exactly-once guarantees.
 type Engine struct {
-	store    *store.Store
+	store    store.EventLog
 	queue    *queue.Client
 	workerID string
 	registry *StepRegistry
@@ -75,7 +75,7 @@ type Engine struct {
 // queue-dispatched messages processed via ProcessStep; pass NewStepRegistry()
 // with the relevant steps registered, or nil if the engine is only used via
 // ExecuteWorkflow (which carries its own StepExecutor instances directly).
-func NewEngine(store *store.Store, queue *queue.Client, workerID string, registry *StepRegistry) *Engine {
+func NewEngine(store store.EventLog, queue *queue.Client, workerID string, registry *StepRegistry) *Engine {
 	if registry == nil {
 		registry = NewStepRegistry()
 	}
@@ -149,8 +149,8 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, wfID uuid.UUID, wfDef *Wor
 		// Execute step business logic
 		output, err := step.Execute(ctx, stepInputs)
 		if err != nil {
-// Record failure
-		_, _ = e.store.AppendEvent(ctx, store.Event{
+			// Record failure
+			_, _ = e.store.AppendEvent(ctx, store.Event{
 				WorkflowID: wfID,
 				StepName:   step.Name(),
 				Type:       store.EventStepFailed,

@@ -56,7 +56,7 @@ func (p *CompensationPlan) Steps() []ExecutedStep {
 
 // ExecuteCompensation runs compensation for all steps in reverse order.
 // Each compensation step is recorded in the event log for crash recovery.
-func (p *CompensationPlan) ExecuteCompensation(ctx context.Context, s *store.Store, workflowID uuid.UUID) error {
+func (p *CompensationPlan) ExecuteCompensation(ctx context.Context, s store.EventLog, workflowID uuid.UUID) error {
 	steps := p.Steps()
 	for i, step := range steps {
 		compDedupKey, err := idempotency.DedupKey(workflowID.String(), "compensate_"+step.Name, step.Output)
@@ -110,7 +110,7 @@ func (p *CompensationPlan) ExecuteCompensation(ctx context.Context, s *store.Sto
 }
 
 // CompensateStep executes a single step's compensation with idempotency.
-func CompensateStep(ctx context.Context, s *store.Store, workflowID uuid.UUID, stepName string, output map[string]any) error {
+func CompensateStep(ctx context.Context, s store.EventLog, workflowID uuid.UUID, stepName string, output map[string]any) error {
 	compDedupKey, err := idempotency.DedupKey(workflowID.String(), "compensate_"+stepName, output)
 	if err != nil {
 		return err

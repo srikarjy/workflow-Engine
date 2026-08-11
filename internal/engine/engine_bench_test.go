@@ -1,147 +1,156 @@
-// Package engine benchmarks.
+// Package engine benchmarks. These run the real Engine against a real
+// PostgreSQL event log (no queue/Redis involved — ExecuteWorkflow doesn't
+// touch the queue). Set BENCH_POSTGRES_DSN, or start the default
+// docker-compose Postgres (`docker compose up -d postgres && go run
+// ./cmd/migrate up`) and they'll use that. Without a reachable database
+// they skip rather than fail or, worse, silently benchmark a mock.
 package engine
 
 import (
 	"context"
-	"encoding/json"
-	"sync"
-	"sync/atomic"
+	"os"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/srikarjy/workflow_engine/internal/idempotency"
+	"github.com/srikarjy/workflow_engine/internal/queue"
 	"github.com/srikarjy/workflow_engine/internal/store"
 )
 
-// Mock store for benchmarking without database - thread-safe
-type mockStore struct {
-	mu        sync.RWMutex
-	events    map[string][]store.Event
-	workflows map[uuid.UUID]*store.Workflow
-	completed map[string]bool
-	counter   atomic.Int64
-}
-
-func newMockStore() *mockStore {
-	return &mockStore{
-		events:    make(map[string][]store.Event),
-		workflows: make(map[uuid.UUID]*store.Workflow),
-		completed: make(map[string]bool),
+func benchDSN() string {
+	if v := os.Getenv("BENCH_POSTGRES_DSN"); v != "" {
+		return v
 	}
+	return "postgres://workflow:workflow@localhost:15432/workflow?sslmode=disable"
 }
 
-func (m *mockStore) CreateWorkflow(ctx context.Context, id uuid.UUID, name string, input json.RawMessage) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.workflows[id] = &store.Workflow{ID: id, Name: name, Status: store.StatusRunning, Input: input}
-	return nil
-}
-
-func (m *mockStore) GetWorkflow(ctx context.Context, id uuid.UUID) (store.Workflow, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	w, ok := m.workflows[id]
-	if !ok {
-		return store.Workflow{}, store.ErrNotFound
+func newBenchStore(b *testing.B) *store.Store {
+	b.Helper()
+	dsn := benchDSN()
+	s, err := store.New(context.Background(), dsn)
+	if err != nil {
+		b.Skipf("postgres unreachable at %s (%v); set BENCH_POSTGRES_DSN or run `docker compose up -d postgres && go run ./cmd/migrate up`", dsn, err)
 	}
-	return *w, nil
-}
-
-func (m *mockStore) UpdateWorkflowStatus(ctx context.Context, id uuid.UUID, status store.WorkflowStatus) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if w, ok := m.workflows[id]; ok {
-		w.Status = status
-	}
-	return nil
-}
-
-func (m *mockStore) AppendEvent(ctx context.Context, e store.Event) (store.Event, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	key := e.DedupKey
-	if e.Type == store.EventStepCompleted || e.Type == store.EventCompensationCompleted {
-		if m.completed[key] {
-			return store.Event{}, store.ErrDuplicateEvent
-		}
-		m.completed[key] = true
-	}
-	e.ID = m.counter.Add(1)
-	e.CreatedAt = time.Now()
-	m.events[e.WorkflowID.String()] = append(m.events[e.WorkflowID.String()], e)
-	return e, nil
-}
-
-func (m *mockStore) HasCompleted(ctx context.Context, dedupKey string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.completed[dedupKey], nil
-}
-
-func (m *mockStore) ReplayEvents(ctx context.Context, workflowID uuid.UUID) ([]store.Event, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.events[workflowID.String()], nil
-}
-
-type mockEngine struct {
-	store *mockStore
-}
-
-func (e *mockEngine) ExecuteWorkflow(ctx context.Context, wfDef *WorkflowDefinition, input map[string]any) (uuid.UUID, error) {
-	wfID := uuid.New()
-	_ = e.store.CreateWorkflow(ctx, wfID, wfDef.Name, mustMarshal(input))
-	for _, step := range wfDef.Steps {
-		dedupKey, _ := idempotency.DedupKey(wfID.String(), step.Name(), input)
-		completed, _ := e.store.HasCompleted(ctx, dedupKey)
-		if completed {
-			continue
-		}
-		output, _ := step.Execute(ctx, input)
-		_, _ = e.store.AppendEvent(ctx, store.Event{
-			WorkflowID: wfID,
-			StepName:   step.Name(),
-			Type:       store.EventStepCompleted,
-			DedupKey:   dedupKey,
-			Payload:    mustMarshal(output),
-		})
-		input = output
-	}
-	return wfID, nil
+	return s
 }
 
 type benchStep struct {
 	name string
 }
 
-func (b *benchStep) Name() string { return b.name }
-func (b *benchStep) Execute(ctx context.Context, input map[string]any) (map[string]any, error) {
-	return map[string]any{"output": b.name}, nil
+func (s *benchStep) Name() string { return s.name }
+func (s *benchStep) Execute(ctx context.Context, input map[string]any) (map[string]any, error) {
+	return map[string]any{"output": s.name}, nil
 }
-func (b *benchStep) Compensate(ctx context.Context, output map[string]any) error {
-	return nil
-}
+func (s *benchStep) Compensate(ctx context.Context, output map[string]any) error { return nil }
 
-func BenchmarkEngine_ExecuteWorkflow(b *testing.B) {
-	s := newMockStore()
-	e := &mockEngine{store: s}
-
-	wfDef := &WorkflowDefinition{
+func benchWorkflowDef() *WorkflowDefinition {
+	return &WorkflowDefinition{
 		Name: "benchmark",
 		Steps: []StepExecutor{
-			&benchStep{name: "step1"},
-			&benchStep{name: "step2"},
-			&benchStep{name: "step3"},
-			&benchStep{name: "step4"},
-			&benchStep{name: "step5"},
+			&benchStep{"step1"}, &benchStep{"step2"}, &benchStep{"step3"}, &benchStep{"step4"}, &benchStep{"step5"},
 		},
 	}
+}
 
+// BenchmarkEngine_ExecuteWorkflow runs a 5-step workflow to completion
+// sequentially against real Postgres: every step writes a step_started and
+// a step_completed event, so this is the true per-workflow cost, not a
+// mock's. Reports p50/p99 workflow latency and step throughput alongside
+// the standard ns/op.
+func BenchmarkEngine_ExecuteWorkflow(b *testing.B) {
+	s := newBenchStore(b)
+	defer s.Close()
+	e := NewEngine(s, nil, "bench-worker", nil)
+	wfDef := benchWorkflowDef()
+
+	durations := make([]time.Duration, 0, b.N)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = e.ExecuteWorkflow(context.Background(), wfDef, map[string]any{"data": "test"})
+		start := time.Now()
+		if _, err := e.ExecuteWorkflow(context.Background(), uuid.New(), wfDef, map[string]any{"data": "test"}); err != nil {
+			b.Fatal(err)
+		}
+		durations = append(durations, time.Since(start))
 	}
+	b.StopTimer()
+
+	reportLatencyPercentiles(b, durations)
+	b.ReportMetric(float64(len(wfDef.Steps))*float64(b.N)/b.Elapsed().Seconds(), "steps/sec")
+}
+
+// BenchmarkEngine_ExecuteWorkflow_Concurrent runs the same 5-step workflow
+// from concurrent goroutines to measure throughput under contention, the
+// scenario the README's "100 concurrent workflows" claim describes. Actual
+// concurrency is bounded by GOMAXPROCS and the store's underlying
+// connection pool, both reported so the number is reproducible.
+func BenchmarkEngine_ExecuteWorkflow_Concurrent(b *testing.B) {
+	s := newBenchStore(b)
+	defer s.Close()
+	e := NewEngine(s, nil, "bench-worker", nil)
+	wfDef := benchWorkflowDef()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := e.ExecuteWorkflow(context.Background(), uuid.New(), wfDef, map[string]any{"data": "test"}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.StopTimer()
+
+	b.ReportMetric(float64(len(wfDef.Steps))*float64(b.N)/b.Elapsed().Seconds(), "steps/sec")
+}
+
+// BenchmarkEngine_ProcessStep measures the queue-driven single-step path
+// (the code ProcessStep actually runs for each dispatched message), against
+// a step registered in a real StepRegistry.
+func BenchmarkEngine_ProcessStep(b *testing.B) {
+	s := newBenchStore(b)
+	defer s.Close()
+
+	registry := NewStepRegistry()
+	registry.Register(&benchStep{"bench_step"})
+	e := NewEngine(s, nil, "bench-worker", registry)
+
+	wfID := uuid.New()
+	if err := s.CreateWorkflow(context.Background(), wfID, "bench", nil); err != nil {
+		b.Fatal(err)
+	}
+
+	durations := make([]time.Duration, 0, b.N)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		msg := queue.StepMessage{
+			WorkflowID: wfID.String(),
+			StepName:   "bench_step",
+			Input:      map[string]any{"i": i}, // varies the dedup key per iteration
+		}
+		start := time.Now()
+		if err := e.ProcessStep(context.Background(), msg); err != nil {
+			b.Fatal(err)
+		}
+		durations = append(durations, time.Since(start))
+	}
+	b.StopTimer()
+
+	reportLatencyPercentiles(b, durations)
+}
+
+func reportLatencyPercentiles(b *testing.B, durations []time.Duration) {
+	if len(durations) == 0 {
+		return
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	p50 := durations[len(durations)*50/100]
+	p99idx := len(durations) * 99 / 100
+	if p99idx >= len(durations) {
+		p99idx = len(durations) - 1
+	}
+	p99 := durations[p99idx]
+	b.ReportMetric(float64(p50.Microseconds())/1000, "p50-ms")
+	b.ReportMetric(float64(p99.Microseconds())/1000, "p99-ms")
 }

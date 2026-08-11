@@ -36,15 +36,15 @@ func BenchmarkDedupKeyFromMap(b *testing.B) {
 	workflowID := "wf-12345678-1234-1234-1234-123456789012"
 	stepName := "step_with_many_fields"
 	input := map[string]any{
-		"field1": "value1",
-		"field2": "value2",
-		"field3": "value3",
-		"field4": "value4",
-		"field5": "value5",
-		"field6": "value6",
-		"field7": "value7",
-		"field8": "value8",
-		"field9": "value9",
+		"field1":  "value1",
+		"field2":  "value2",
+		"field3":  "value3",
+		"field4":  "value4",
+		"field5":  "value5",
+		"field6":  "value6",
+		"field7":  "value7",
+		"field8":  "value8",
+		"field9":  "value9",
 		"field10": "value10",
 	}
 

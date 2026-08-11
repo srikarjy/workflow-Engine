@@ -80,7 +80,7 @@ type testResult struct {
 
 func main() {
 	var (
-		postgresDSN  = flag.String("postgres", "postgres://postgres:postgres@localhost:5432/workflow", "PostgreSQL DSN")
+		postgresDSN  = flag.String("postgres", "postgres://workflow:workflow@localhost:15432/workflow?sslmode=disable", "PostgreSQL DSN")
 		redisAddr    = flag.String("redis", "localhost:6379", "Redis address")
 		runsPerPoint = flag.Int("runs", 80, "Runs per injection point (total = runs * 6)")
 		streamName   = flag.String("stream", "workflow-steps", "Redis stream name prefix (each run gets its own stream)")
