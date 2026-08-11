@@ -1,4 +1,53 @@
 {
   "name": "order-saga",
-  "steps": []
+  "steps": [
+    {
+      "name": "reserve_inventory",
+      "input": {
+        "items": [
+          {"product_id": "SKU-001", "quantity": 2},
+          {"product_id": "SKU-002", "quantity": 1}
+        ]
+      },
+      "compensation": "release_inventory"
+    },
+    {
+      "name": "charge_payment",
+      "input": {
+        "amount_cents": 2999,
+        "currency": "USD",
+        "payment_method_id": "pm_123"
+      },
+      "compensation": "refund_payment"
+    },
+    {
+      "name": "create_shipment",
+      "input": {
+        "address": {
+          "street": "123 Main St",
+          "city": "San Francisco",
+          "state": "CA",
+          "zip": "94105"
+        },
+        "items": ["SKU-001", "SKU-001", "SKU-002"]
+      },
+      "compensation": "cancel_shipment"
+    },
+    {
+      "name": "send_confirmation",
+      "input": {
+        "email": "customer@example.com",
+        "template": "order_confirmed"
+      },
+      "compensation": "send_cancellation_notice"
+    },
+    {
+      "name": "update_analytics",
+      "input": {
+        "event": "order_placed",
+        "properties": {"revenue_cents": 2999}
+      },
+      "compensation": "revert_analytics"
+    }
+  ]
 }
