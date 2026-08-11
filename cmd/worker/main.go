@@ -36,6 +36,9 @@ func main() {
 
 		faultSaga = flag.Bool("fault-saga", false, "Run a single hardcoded 2-success+1-failure saga directly (bypassing the queue) to exercise Saga compensation, then exit. Used by cmd/faultinject.")
 		wfIDFlag  = flag.String("wf-id", "", "Workflow ID for -fault-saga (required); reuse the same ID across a crash and its replacement run to resume compensation")
+
+		metalswBin      = flag.String("metalsw-bin", "", "Path to metalsw's compiled gpu_main binary; metalsw step registered only if set")
+		metalswMetallib = flag.String("metalsw-metallib", "smith_waterman.metallib", "Path to metalsw's compiled Metal shader library")
 	)
 	flag.Parse()
 
@@ -55,6 +58,9 @@ func main() {
 	registry := engine.NewStepRegistry()
 	for _, step := range steps.OrderSagaSteps() {
 		registry.Register(step)
+	}
+	if *metalswBin != "" {
+		registry.Register(steps.NewMetalSWStep(*metalswBin, *metalswMetallib))
 	}
 
 	if *faultSaga {
