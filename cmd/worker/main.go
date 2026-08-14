@@ -33,6 +33,7 @@ func main() {
 		blockTime   = flag.Duration("block", 5*time.Second, "Block time for XREADGROUP")
 		count       = flag.Int64("count", 10, "Max messages per fetch")
 		reclaimIdle = flag.Duration("reclaim-idle", 5*time.Second, "Reclaim pending messages idle at least this long, from any consumer (picks up work orphaned by a crashed worker)")
+		maxMessages = flag.Int("max-messages", 0, "Exit after processing this many messages (0 = run forever)")
 
 		faultSaga = flag.Bool("fault-saga", false, "Run a single hardcoded 2-success+1-failure saga directly (bypassing the queue) to exercise Saga compensation, then exit. Used by cmd/faultinject.")
 		wfIDFlag  = flag.String("wf-id", "", "Workflow ID for -fault-saga (required); reuse the same ID across a crash and its replacement run to resume compensation")

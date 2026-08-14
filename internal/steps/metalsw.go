@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/srikarjy/workflow_engine/internal/engine"
+	"github.com/srikarjy/workflow_engine/internal/faultinject"
 )
 
 // metalswHit is one line of gpu_main's stdout: "%-20s %d\n" (id, score).
@@ -75,7 +76,11 @@ func (s *metalswStep) Execute(ctx context.Context, input map[string]any) (map[st
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	faultinject.Crash("metalsw_before_execution")
+
 	runErr := cmd.Run()
+
+	faultinject.Crash("metalsw_after_execution_before_parse")
 
 	hits, parseErr := parseMetalSWHits(stdout.String())
 	if parseErr != nil {
@@ -83,6 +88,8 @@ func (s *metalswStep) Execute(ctx context.Context, input map[string]any) (map[st
 	}
 
 	mismatches, mismatchTotal := parseMismatchSummary(stderr.String())
+
+	faultinject.Crash("metalsw_after_parse_before_return")
 
 	if runErr != nil {
 		// A non-zero exit with parsed mismatch counts means gpu_main ran
