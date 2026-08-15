@@ -6,6 +6,53 @@ Built in **Go** to demonstrate the low-level primitives that production workflow
 
 ---
 
+## In Plain English (no engineering background required)
+
+Think about buying something online. Clicking "Place Order" quietly kicks off
+several steps that all have to happen, in order:
+
+1. Reserve the item in the warehouse
+2. Charge your credit card
+3. Ship the package
+4. Email you a confirmation
+
+This project is software that runs multi-step processes like that one
+**reliably** — meaning it correctly handles the two things that make this
+surprisingly hard to get right in the real world:
+
+- **Computers crash mid-task.** If the server crashes right after charging
+  your card but before shipping, what happens next? Did it charge you
+  twice when it retries? Did your order vanish? This engine guarantees
+  each step runs **exactly once** — never skipped, never repeated — even
+  if the process handling it dies and a replacement has to pick up where
+  it left off.
+- **Steps fail, and failures need to be undone.** If your card gets
+  charged but the warehouse is out of stock, someone has to actually
+  refund you — not just make a note that a refund *should* happen. This
+  engine automatically calls a real "undo" step (refund the payment,
+  release the reservation, etc.) for every step that already succeeded,
+  in reverse order, whenever a later step fails.
+
+On top of that: **defining a new multi-step process doesn't require
+writing code.** You describe the steps in a plain text file (YAML) —
+each one just points at a web address to call — and the engine handles
+the reliability guarantees underneath. There's also a web page (a
+"dashboard") where you can watch every process run, step by step, in
+real time.
+
+This is the same kind of problem that payment systems (Stripe), e-commerce
+order pipelines (Amazon), and ride-matching backends (Uber) all have to
+solve. Companies usually buy this capability from a specialized product
+(Temporal, AWS Step Functions, and similar "workflow orchestrators" are the
+category). This project is a small version built from scratch to
+demonstrate — and prove, with automated tests that actually crash the
+program on purpose and check it recovered correctly — an understanding of
+how those systems work underneath.
+
+Everything below this point gets progressively more technical.
+
+---
+
 ## Features
 
 - Define workflows as **YAML**, no Go required: each step is an HTTP call against your own services (see [Workflow Definitions](#workflow-definitions)).
