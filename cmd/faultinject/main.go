@@ -109,9 +109,9 @@ func main() {
 
 	// Metalsw injection points require the binary
 	metalswInjectionPoints := map[injectionPoint]bool{
-		MetalswBeforeExecution: true,
+		MetalswBeforeExecution:           true,
 		MetalswAfterExecutionBeforeParse: true,
-		MetalswAfterParseBeforeReturn: true,
+		MetalswAfterParseBeforeReturn:    true,
 	}
 	hasMetalswBin := *metalswBin != ""
 	totalInjectionPoints := int(injectionPointCount)
@@ -205,9 +205,9 @@ func runInjectionTest(ip injectionPoint, run int, postgresDSN, redisAddr, baseSt
 
 	// Metalsw injection points need special handling
 	metalswInjectionPoints := map[injectionPoint]bool{
-		MetalswBeforeExecution: true,
+		MetalswBeforeExecution:           true,
 		MetalswAfterExecutionBeforeParse: true,
-		MetalswAfterParseBeforeReturn: true,
+		MetalswAfterParseBeforeReturn:    true,
 	}
 	if metalswInjectionPoints[ip] {
 		return runMetalswInjectionTest(ip, run, postgresDSN, redisAddr, baseStream, groupName, workerPath, metalswBin, metalswMetallib, start)
@@ -592,11 +592,10 @@ func runConcurrentWorkersTest(postgresDSN, redisAddr, streamName, groupName, wor
 
 	var wg sync.WaitGroup
 	results := make(chan struct {
-		run          int
-		completions  int
-		doubleExec   bool
-		lostStep     bool
-		workerCounts map[string]int
+		run         int
+		completions int
+		doubleExec  bool
+		lostStep    bool
 	}, numRuns)
 
 	for run := 0; run < numRuns; run++ {
@@ -615,23 +614,20 @@ func runConcurrentWorkersTest(postgresDSN, redisAddr, streamName, groupName, wor
 
 	var totalCompletions, totalDoubleExec, totalLostSteps int
 	runStats := make([]struct {
-		completions  int
-		doubleExec   bool
-		lostStep     bool
-		workerCounts map[string]int
+		completions int
+		doubleExec  bool
+		lostStep    bool
 	}, numRuns)
 
 	for result := range results {
 		runStats[result.run] = struct {
-			completions  int
-			doubleExec   bool
-			lostStep     bool
-			workerCounts map[string]int
+			completions int
+			doubleExec  bool
+			lostStep    bool
 		}{
-			completions:  result.completions,
-			doubleExec:   result.doubleExec,
-			lostStep:     result.lostStep,
-			workerCounts: result.workerCounts,
+			completions: result.completions,
+			doubleExec:  result.doubleExec,
+			lostStep:    result.lostStep,
 		}
 		totalCompletions += result.completions
 		if result.doubleExec {
@@ -642,16 +638,12 @@ func runConcurrentWorkersTest(postgresDSN, redisAddr, streamName, groupName, wor
 		}
 	}
 
-	fmt.Println("\n| Run | Completions | Double Exec | Lost Step | Worker Distribution |")
-	fmt.Println("|----:|------------:|:-----------:|:---------:|---------------------|")
+	fmt.Println("\n| Run | Completions | Double Exec | Lost Step |")
+	fmt.Println("|----:|------------:|:-----------:|:---------:|")
 	for i, stats := range runStats {
-		workerDist := ""
-		for worker, count := range stats.workerCounts {
-			workerDist += fmt.Sprintf("%s=%d ", worker, count)
-		}
-		fmt.Printf("| %3d | %11d | %11v | %9v | %s |\n", i, stats.completions, stats.doubleExec, stats.lostStep, workerDist)
+		fmt.Printf("| %3d | %11d | %11v | %9v |\n", i, stats.completions, stats.doubleExec, stats.lostStep)
 	}
-	fmt.Printf("| **Total** | **%11d** | **%11v** | **%9v** |                     |\n", totalCompletions, totalDoubleExec > 0, totalLostSteps > 0)
+	fmt.Printf("| **Total** | **%11d** | **%11v** | **%9v** |\n", totalCompletions, totalDoubleExec > 0, totalLostSteps > 0)
 
 	fmt.Printf("\nConcurrent workers test: %d runs, %d total completions, %d double executions, %d lost steps\n",
 		numRuns, totalCompletions, totalDoubleExec, totalLostSteps)
@@ -666,7 +658,6 @@ func runSingleConcurrentTest(ctx context.Context, pool *pgxpool.Pool, s store.Ev
 	completions int
 	doubleExec  bool
 	lostStep    bool
-	workerCounts map[string]int
 } {
 	wfID := uuid.New()
 	testID := fmt.Sprintf("concurrent-%d-%d", run, time.Now().UnixNano())
@@ -680,7 +671,6 @@ func runSingleConcurrentTest(ctx context.Context, pool *pgxpool.Pool, s store.Ev
 			completions int
 			doubleExec  bool
 			lostStep    bool
-			workerCounts map[string]int
 		}{run: run, doubleExec: true, lostStep: true}
 	}
 
@@ -699,24 +689,23 @@ func runSingleConcurrentTest(ctx context.Context, pool *pgxpool.Pool, s store.Ev
 			completions int
 			doubleExec  bool
 			lostStep    bool
-			workerCounts map[string]int
 		}{run: run, doubleExec: true, lostStep: true}
 	}
 
 	// Start N workers all on the SAME stream and SAME consumer group
 	// They will race to claim the single message
 	var wg sync.WaitGroup
-	workerCounts := make(map[string]int)
-	var countsMu sync.Mutex
 
-	workerDone := make(chan struct{})
+	// Use a timeout context to prevent hanging
+	testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		workerID := fmt.Sprintf("concurrent-%s-w%d", testID, i)
 		go func(workerID string) {
 			defer wg.Done()
-			cmd := exec.Command(workerPath,
+			cmd := exec.CommandContext(testCtx, workerPath,
 				"-postgres", postgresDSN,
 				"-redis", redisAddr,
 				"-stream", streamName,
@@ -724,27 +713,17 @@ func runSingleConcurrentTest(ctx context.Context, pool *pgxpool.Pool, s store.Ev
 				"-worker-id", workerID,
 				"-workers", "1",
 				"-reclaim-idle", "0s",
+				"-max-messages", "1",
 			)
-			// Run until the message is processed
-			if err := cmd.Run(); err != nil {
-				log.Printf("Worker %s exited with error: %v", workerID, err)
-			}
-			// Track which worker did the work by checking completions
-			var count int
-			_ = pool.QueryRow(ctx, `
-				SELECT COUNT(*) FROM events
-				WHERE workflow_id = $1 AND step_name = $2 AND event_type = 'step_completed'
-				AND payload::jsonb @> '{"worker_id": "' + workerID + '"}'
-			`, wfID, stepName).Scan(&count)
-			countsMu.Lock()
-			workerCounts[workerID] = count
-			countsMu.Unlock()
+			// Run until the message is processed (max 1 message) or the
+			// test context times out; losing workers block on an empty
+			// stream until then, so a non-zero exit here is expected.
+			_ = cmd.Run()
 		}(workerID)
 	}
 
-	// Wait for all workers to finish
+	// Wait for all workers to finish or timeout
 	wg.Wait()
-	close(workerDone)
 
 	// Count total completions
 	var completionCount int
@@ -759,7 +738,6 @@ func runSingleConcurrentTest(ctx context.Context, pool *pgxpool.Pool, s store.Ev
 			completions int
 			doubleExec  bool
 			lostStep    bool
-			workerCounts map[string]int
 		}{run: run, doubleExec: true, lostStep: true}
 	}
 
@@ -771,12 +749,10 @@ func runSingleConcurrentTest(ctx context.Context, pool *pgxpool.Pool, s store.Ev
 		completions int
 		doubleExec  bool
 		lostStep    bool
-		workerCounts map[string]int
 	}{
-		run:          run,
-		completions:  completionCount,
-		doubleExec:   doubleExec,
-		lostStep:     lostStep,
-		workerCounts: workerCounts,
+		run:         run,
+		completions: completionCount,
+		doubleExec:  doubleExec,
+		lostStep:    lostStep,
 	}
 }

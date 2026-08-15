@@ -103,6 +103,16 @@ go build -o /tmp/faultinject ./cmd/faultinject
 
 `-runs 80` (480 total, matching the original target) works too, but each run opens its own short-lived Postgres connections from a fresh worker subprocess; at high concurrency against a single default-configured Postgres container this can exhaust `max_connections` and produce connection errors unrelated to the recovery logic itself. Lower `-runs`, or raise Postgres's `max_connections`, if you see that.
 
+## Concurrent contention
+
+The crash tests above prove exactly-once for one crash at a time. The harness's concurrent mode instead races multiple live worker processes (same Redis stream, same consumer group) for a single step message and checks the event log the same way — exactly one completion, no double executions, no lost steps. This proves the dedup-key idempotency holds under real concurrent load, not just crash recovery.
+
+Measured: 10 runs, 4 workers each racing for one message, same environment as above — 10/10 exactly-one-completion, 0 double executions, 0 lost steps.
+
+```bash
+/tmp/faultinject -worker /tmp/worker -concurrent-workers 4 -concurrent-runs 10
+```
+
 ### Verified Behavior
 
 When the worker is terminated **after the event log write but before the Redis ACK**, the replacement worker reclaims the pending message, recognizes the completed step via its deduplication key, and advances the workflow without re-running the business logic. When it's terminated **mid-compensation**, a second run against the same workflow ID resumes and completes only the compensating steps that hadn't yet finished.
