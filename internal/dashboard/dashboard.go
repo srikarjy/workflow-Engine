@@ -136,5 +136,16 @@ func Handler(s *store.Store, cfg Config) http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]any{"workflow": wf, "events": events})
 	})
 
-	return rateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, authMiddleware(cfg.AuthToken, mux))
+	protected := rateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, authMiddleware(cfg.AuthToken, mux))
+
+	top := http.NewServeMux()
+	// Deliberately outside the auth/rate-limit wrapping: a platform health
+	// check (e.g. Fly.io) has no way to carry the bearer token, and this
+	// exposes nothing sensitive (a static 200, no workflow data).
+	top.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	top.Handle("/", protected)
+	return top
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,8 +27,8 @@ import (
 
 func main() {
 	var (
-		postgresDSN = flag.String("postgres", "postgres://workflow:workflow@localhost:15432/workflow?sslmode=disable", "PostgreSQL DSN")
-		redisAddr   = flag.String("redis", "localhost:6379", "Redis address")
+		postgresDSN = flag.String("postgres", envOr("DATABASE_URL", "postgres://workflow:workflow@localhost:15432/workflow?sslmode=disable"), "PostgreSQL DSN. Defaults to $DATABASE_URL.")
+		redisAddr   = flag.String("redis", envOr("REDIS_URL", "localhost:6379"), "Redis address (\"host:port\") or a full redis://.../rediss://... URL (e.g. from a managed provider like Upstash). Defaults to $REDIS_URL.")
 		streamName  = flag.String("stream", "workflow-steps", "Redis stream name")
 		groupName   = flag.String("group", "workers", "Consumer group name")
 		workerID    = flag.String("worker-id", "", "Worker ID (auto-generated if empty)")
@@ -35,7 +36,7 @@ func main() {
 		blockTime   = flag.Duration("block", 5*time.Second, "Block time for XREADGROUP")
 		count       = flag.Int64("count", 10, "Max messages per fetch")
 		reclaimIdle = flag.Duration("reclaim-idle", 5*time.Second, "Reclaim pending messages idle at least this long, from any consumer (picks up work orphaned by a crashed worker)")
-		httpAddr    = flag.String("http", ":8080", "Address to serve the dashboard (/) and Prometheus metrics (/metrics) on; empty disables it")
+		httpAddr    = flag.String("http", ":"+envOr("PORT", "8080"), "Address to serve the dashboard (/) and Prometheus metrics (/metrics) on; empty disables it. Port defaults to $PORT (what most PaaS hosts, e.g. Render, require binding to).")
 		maxMessages = flag.Int("max-messages", 0, "Exit after processing this many messages (0 = run forever)")
 
 		authToken      = flag.String("auth-token", os.Getenv("WORKFLOW_DASHBOARD_TOKEN"), "Bearer token required on every dashboard/metrics request; empty disables auth (fine for local dev, NOT for a public deployment). Defaults to $WORKFLOW_DASHBOARD_TOKEN so it doesn't need to appear on the command line.")
@@ -105,10 +106,14 @@ func main() {
 	}
 	defer pool.Close()
 
-	// Connect to Redis
-	rdb := redis.NewClient(&redis.Options{
-		Addr: *redisAddr,
-	})
+	// Connect to Redis. -redis accepts either a bare "host:port" (local
+	// dev) or a full redis://.../rediss://... URL with embedded auth and
+	// TLS, as managed providers like Upstash hand out.
+	redisOpts, err := parseRedisAddr(*redisAddr)
+	if err != nil {
+		log.Fatalf("Invalid -redis value: %v", err)
+	}
+	rdb := redis.NewClient(redisOpts)
 	defer rdb.Close()
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -156,6 +161,24 @@ func main() {
 	cancel()
 	wg.Wait()
 	log.Println("All workers stopped")
+}
+
+// envOr returns the environment variable key's value, or def if unset.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// parseRedisAddr accepts either a bare "host:port" or a full redis:// /
+// rediss:// URL (the form managed providers like Upstash issue, with auth
+// and TLS embedded) and returns the corresponding *redis.Options.
+func parseRedisAddr(addr string) (*redis.Options, error) {
+	if strings.Contains(addr, "://") {
+		return redis.ParseURL(addr)
+	}
+	return &redis.Options{Addr: addr}, nil
 }
 
 // runFaultSaga runs a fixed 2-step-success-then-1-step-failure workflow

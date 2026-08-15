@@ -227,6 +227,42 @@ warning rather than failing silently.
 
 ---
 
+# Deploying
+
+The included `Dockerfile` builds `cmd/worker` (the deployable service: the
+worker pool plus the dashboard/metrics HTTP server) and applies migrations
+automatically on container start via `docker-entrypoint.sh`, so there's
+nothing to run manually before the app boots.
+
+It reads its configuration entirely from environment variables, so it
+deploys against **free-tier managed Postgres and Redis** with no self-hosted
+database to pay for:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Postgres connection string (e.g. from [Neon](https://neon.tech)) |
+| `REDIS_URL` | Redis connection string — `redis://` or `rediss://` with embedded auth (e.g. from [Upstash](https://upstash.com)) |
+| `WORKFLOW_DASHBOARD_TOKEN` | Bearer token required on every dashboard/`/metrics` request — **set this before deploying publicly** |
+| `PORT` | HTTP port to bind (most PaaS hosts, e.g. Render, set this automatically) |
+
+`render.yaml` is a ready-to-import [Render Blueprint](https://render.com/docs/blueprint-spec)
+targeting Render's free web service plan (no credit card required; the
+service spins down after 15 minutes idle and cold-starts on the next
+request — the tradeoff for $0 hosting). `/healthz` is unauthenticated
+specifically so the platform's health check doesn't need the bearer token.
+
+```bash
+# Local sanity check before deploying anywhere:
+docker build -t workflow-engine .
+docker run --rm -p 8080:8080 \
+  -e DATABASE_URL=<your-postgres-url> \
+  -e REDIS_URL=<your-redis-url> \
+  -e WORKFLOW_DASHBOARD_TOKEN=<a-random-secret> \
+  workflow-engine
+```
+
+---
+
 # Workflow Definitions
 
 A workflow is a YAML file: a name, an ordered list of steps, and an optional

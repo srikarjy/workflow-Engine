@@ -1,0 +1,18 @@
+# Render Blueprint (https://render.com/docs/blueprint-spec). Import this
+# repo on Render and it creates the service below pre-configured; secrets
+# (DATABASE_URL, REDIS_URL, WORKFLOW_DASHBOARD_TOKEN) are marked sync:false
+# so Render prompts for them in its dashboard instead of storing them here.
+services:
+  - type: web
+    name: workflow-engine
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: WORKFLOW_DASHBOARD_TOKEN
+        sync: false
