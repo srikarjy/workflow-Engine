@@ -257,3 +257,342 @@ func TestExecuteWorkflow_FailureCompensatesCompletedStepsInReverseOrder(t *testi
 		t.Errorf("step2.Compensate called %d times, want 1", step2.compensateCalls())
 	}
 }
+
+// TestExecuteAgentic_RouterDecidesNextStep verifies that an agentic workflow
+// uses the Router function to dynamically decide the next step based on
+// the previous step's output.
+func TestExecuteAgentic_RouterDecidesNextStep(t *testing.T) {
+	log := newFakeEventLog()
+	registry := NewStepRegistry()
+	var steps []string
+	mk := func(name string) *spyStep {
+		return &spyStep{name: name, outputFunc: func(in map[string]any) map[string]any {
+			steps = append(steps, name)
+			out := map[string]any{}
+			for k, v := range in {
+				out[k] = v
+			}
+			out[name] = true
+			return out
+		}}
+	}
+	s1 := mk("retrieve_papers")
+	s2 := mk("analyze_evidence")
+	s3 := mk("synthesize_conclusion")
+	registry.Register(s1)
+	registry.Register(s2)
+	registry.Register(s3)
+
+	e := NewEngine(log, nil, "test-worker", registry)
+
+	wfID := uuid.New()
+
+	// Router that chains: retrieve -> analyze -> synthesize -> done
+	calls := 0
+	router := func(ctx context.Context, _ uuid.UUID, prevStep string, prevOutput map[string]any) (string, map[string]any, error) {
+		calls++
+		switch prevStep {
+		case "retrieve_papers":
+			return "analyze_evidence", prevOutput, nil
+		case "analyze_evidence":
+			return "synthesize_conclusion", prevOutput, nil
+		case "synthesize_conclusion":
+			return "", nil, nil // workflow complete
+		default:
+			return "", nil, errors.New("unexpected step")
+		}
+	}
+
+	_, err := e.ExecuteAgentic(context.Background(), wfID, AgenticWorkflowConfig{
+		StartStepName: "retrieve_papers",
+		StartInput:    map[string]any{"query": "test"},
+		Router:        router,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteAgentic: %v", err)
+	}
+
+	// Verify all three steps executed in order
+	want := []string{"retrieve_papers", "analyze_evidence", "synthesize_conclusion"}
+	if len(steps) != len(want) {
+		t.Fatalf("steps = %v, want %v", steps, want)
+	}
+	for i := range want {
+		if steps[i] != want[i] {
+			t.Errorf("steps = %v, want %v", steps, want)
+			break
+		}
+	}
+	if calls != 3 {
+		t.Errorf("router called %d times, want 3", calls)
+	}
+}
+
+// TestExecuteAgentic_ResumesWithoutReExecutingCompletedSteps verifies
+// crash recovery works for agentic workflows: a resumed run skips
+// already-completed steps and continues from the router's decision.
+func TestExecuteAgentic_ResumesWithoutReExecutingCompletedSteps(t *testing.T) {
+	log := newFakeEventLog()
+	registry := NewStepRegistry()
+
+	step1 := &spyStep{name: "retrieve_papers"}
+	step2 := &spyStep{name: "analyze_evidence"}
+	step3 := &spyStep{name: "synthesize_conclusion"}
+	registry.Register(step1)
+	registry.Register(step2)
+	registry.Register(step3)
+
+	e := NewEngine(log, nil, "test-worker", registry)
+
+	router := func(ctx context.Context, _ uuid.UUID, prevStep string, prevOutput map[string]any) (string, map[string]any, error) {
+		switch prevStep {
+		case "retrieve_papers":
+			return "analyze_evidence", prevOutput, nil
+		case "analyze_evidence":
+			return "synthesize_conclusion", prevOutput, nil
+		case "synthesize_conclusion":
+			return "", nil, nil
+		default:
+			return "", nil, errors.New("unexpected step")
+		}
+	}
+
+	wfID := uuid.New()
+
+	// First run completes all steps.
+	if _, err := e.ExecuteAgentic(context.Background(), wfID, AgenticWorkflowConfig{
+		StartStepName: "retrieve_papers",
+		StartInput:    map[string]any{"query": "test"},
+		Router:        router,
+	}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if step1.calls() != 1 || step2.calls() != 1 || step3.calls() != 1 {
+		t.Fatalf("first run: calls=%d/%d/%d, want 1/1/1", step1.calls(), step2.calls(), step3.calls())
+	}
+
+	// Resume same workflow ID - should skip all completed steps.
+	if _, err := e.ExecuteAgentic(context.Background(), wfID, AgenticWorkflowConfig{
+		StartStepName: "retrieve_papers",
+		StartInput:    map[string]any{"query": "test"},
+		Router:        router,
+	}); err != nil {
+		t.Fatalf("resumed run: %v", err)
+	}
+	if step1.calls() != 1 || step2.calls() != 1 || step3.calls() != 1 {
+		t.Errorf("resumed run re-executed: calls=%d/%d/%d, want 1/1/1", step1.calls(), step2.calls(), step3.calls())
+	}
+}
+
+// TestExecuteAgentic_FailureCompensatesCompletedSteps verifies that
+// if a step fails, the agentic workflow triggers Saga compensation
+// for previously completed steps.
+func TestExecuteAgentic_FailureCompensatesCompletedSteps(t *testing.T) {
+	log := newFakeEventLog()
+	registry := NewStepRegistry()
+
+	step1 := &spyStep{name: "retrieve_papers"}
+	step2 := &spyStep{name: "analyze_evidence"}
+	step3 := &spyStep{name: "synthesize_conclusion", failWith: errForced}
+	registry.Register(step1)
+	registry.Register(step2)
+	registry.Register(step3)
+
+	e := NewEngine(log, nil, "test-worker", registry)
+
+	router := func(ctx context.Context, _ uuid.UUID, prevStep string, prevOutput map[string]any) (string, map[string]any, error) {
+		switch prevStep {
+		case "retrieve_papers":
+			return "analyze_evidence", prevOutput, nil
+		case "analyze_evidence":
+			return "synthesize_conclusion", prevOutput, nil
+		case "synthesize_conclusion":
+			return "", nil, nil
+		default:
+			return "", nil, errors.New("unexpected step")
+		}
+	}
+
+	wfID := uuid.New()
+
+	_, err := e.ExecuteAgentic(context.Background(), wfID, AgenticWorkflowConfig{
+		StartStepName: "retrieve_papers",
+		StartInput:    map[string]any{"query": "test"},
+		Router:        router,
+	})
+	if err == nil {
+		t.Fatal("expected an error from the failing final step")
+	}
+
+	events, _ := log.ReplayEvents(context.Background(), wfID)
+	var compensationOrder []string
+	for _, ev := range events {
+		if ev.Type == store.EventCompensationCompleted {
+			compensationOrder = append(compensationOrder, ev.StepName)
+		}
+	}
+	want := []string{"compensate_analyze_evidence", "compensate_retrieve_papers"}
+	if len(compensationOrder) != len(want) {
+		t.Fatalf("compensation order = %v, want %v", compensationOrder, want)
+	}
+	for i := range want {
+		if compensationOrder[i] != want[i] {
+			t.Errorf("compensation order = %v, want %v", compensationOrder, want)
+			break
+		}
+	}
+}
+
+// TestRouterDecisionCache_CachesAndReplaysDecisions verifies that the
+// RouterDecisionCache caches routing decisions and replays them for
+// identical contexts, avoiding re-calling the underlying router.
+func TestRouterDecisionCache_CachesAndReplaysDecisions(t *testing.T) {
+	log := newFakeEventLog()
+	registry := NewStepRegistry()
+
+	step1 := &spyStep{name: "step1"}
+	step2 := &spyStep{name: "step2"}
+	step3 := &spyStep{name: "step3"}
+	registry.Register(step1)
+	registry.Register(step2)
+	registry.Register(step3)
+
+	e := NewEngine(log, nil, "test-worker", registry)
+
+	cache := NewRouterDecisionCache()
+	routerCalls := 0
+
+	router := func(ctx context.Context, _ uuid.UUID, prevStep string, prevOutput map[string]any) (string, map[string]any, error) {
+		routerCalls++
+		switch prevStep {
+		case "step1":
+			return "step2", prevOutput, nil
+		case "step2":
+			return "step3", prevOutput, nil
+		case "step3":
+			return "", nil, nil
+		default:
+			return "", nil, errors.New("unexpected step")
+		}
+	}
+
+	wfID := uuid.New()
+
+	// First run - should call router for each step
+	if _, err := e.ExecuteAgentic(context.Background(), wfID, AgenticWorkflowConfig{
+		StartStepName: "step1",
+		StartInput:    map[string]any{"query": "test"},
+		Router:        router,
+		RouterCache:   cache,
+	}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	if routerCalls != 3 {
+		t.Errorf("first run: router called %d times, want 3", routerCalls)
+	}
+
+	// Second run with same workflow ID and input - should replay all decisions from cache
+	routerCalls = 0
+	wfID2 := uuid.New()
+	if _, err := e.ExecuteAgentic(context.Background(), wfID2, AgenticWorkflowConfig{
+		StartStepName: "step1",
+		StartInput:    map[string]any{"query": "test"},
+		Router:        router,
+		RouterCache:   cache,
+	}); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+
+	if routerCalls != 0 {
+		t.Errorf("second run: router called %d times, want 0 (cached)", routerCalls)
+	}
+
+	// Third run with different input - should call router again
+	routerCalls = 0
+	wfID3 := uuid.New()
+	if _, err := e.ExecuteAgentic(context.Background(), wfID3, AgenticWorkflowConfig{
+		StartStepName: "step1",
+		StartInput:    map[string]any{"query": "different"},
+		Router:        router,
+		RouterCache:   cache,
+	}); err != nil {
+		t.Fatalf("third run: %v", err)
+	}
+
+	if routerCalls != 3 {
+		t.Errorf("third run (different input): router called %d times, want 3", routerCalls)
+	}
+}
+
+// TestExecuteAgentic_CacheWorksWithCrashRecovery verifies that the
+// RouterDecisionCache works correctly when a workflow crashes and
+// is resumed - it should replay cached decisions for already-completed steps.
+func TestExecuteAgentic_CacheWorksWithCrashRecovery(t *testing.T) {
+	log := newFakeEventLog()
+	registry := NewStepRegistry()
+
+	step1 := &spyStep{name: "retrieve_papers"}
+	step2 := &spyStep{name: "analyze_evidence"}
+	step3 := &spyStep{name: "synthesize_conclusion"}
+	registry.Register(step1)
+	registry.Register(step2)
+	registry.Register(step3)
+
+	e := NewEngine(log, nil, "test-worker", registry)
+
+	cache := NewRouterDecisionCache()
+	routerCalls := 0
+
+	router := func(ctx context.Context, _ uuid.UUID, prevStep string, prevOutput map[string]any) (string, map[string]any, error) {
+		routerCalls++
+		switch prevStep {
+		case "retrieve_papers":
+			return "analyze_evidence", prevOutput, nil
+		case "analyze_evidence":
+			return "synthesize_conclusion", prevOutput, nil
+		case "synthesize_conclusion":
+			return "", nil, nil
+		default:
+			return "", nil, errors.New("unexpected step")
+		}
+	}
+
+	wfID := uuid.New()
+
+	// First run completes all steps
+	if _, err := e.ExecuteAgentic(context.Background(), wfID, AgenticWorkflowConfig{
+		StartStepName: "retrieve_papers",
+		StartInput:    map[string]any{"query": "test"},
+		Router:        router,
+		RouterCache:   cache,
+	}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	initialRouterCalls := routerCalls
+	if initialRouterCalls != 3 {
+		t.Errorf("first run: router called %d times, want 3", initialRouterCalls)
+	}
+
+	// Resume same workflow ID - should skip completed steps and use cached decisions
+	routerCalls = 0
+	if _, err := e.ExecuteAgentic(context.Background(), wfID, AgenticWorkflowConfig{
+		StartStepName: "retrieve_papers",
+		StartInput:    map[string]any{"query": "test"},
+		Router:        router,
+		RouterCache:   cache,
+	}); err != nil {
+		t.Fatalf("resumed run: %v", err)
+	}
+
+	// No router calls should be made since all steps are completed and cached
+	if routerCalls != 0 {
+		t.Errorf("resumed run: router called %d times, want 0 (all cached)", routerCalls)
+	}
+
+	// Verify steps were not re-executed
+	if step1.calls() != 1 || step2.calls() != 1 || step3.calls() != 1 {
+		t.Errorf("resumed run re-executed: calls=%d/%d/%d, want 1/1/1", step1.calls(), step2.calls(), step3.calls())
+	}
+}

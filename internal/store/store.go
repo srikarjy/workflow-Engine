@@ -25,6 +25,7 @@ const (
 	EventCompensationCompleted EventType = "compensation_completed"
 	EventWorkflowCompleted     EventType = "workflow_completed"
 	EventWorkflowFailed        EventType = "workflow_failed"
+	EventNotificationSent      EventType = "notification_sent"
 )
 
 type WorkflowStatus string
@@ -45,6 +46,7 @@ type EventLog interface {
 	UpdateWorkflowStatus(ctx context.Context, id uuid.UUID, status WorkflowStatus) error
 	AppendEvent(ctx context.Context, e Event) (Event, error)
 	HasCompleted(ctx context.Context, dedupKey string) (bool, error)
+	HasNotificationSent(ctx context.Context, dedupKey string) (bool, error)
 	ReplayEvents(ctx context.Context, workflowID uuid.UUID) ([]Event, error)
 }
 
@@ -188,6 +190,20 @@ func (s *Store) HasCompleted(ctx context.Context, dedupKey string) (bool, error)
 			AND event_type IN ($2, $3)
 		)
 	`, dedupKey, EventStepCompleted, EventCompensationCompleted).Scan(&exists)
+	return exists, err
+}
+
+// HasNotificationSent reports whether a notification event already exists
+// for the given dedup key. Used for idempotent notification sending.
+func (s *Store) HasNotificationSent(ctx context.Context, dedupKey string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM events
+			WHERE dedup_key = $1
+			AND event_type = $2
+		)
+	`, dedupKey, EventNotificationSent).Scan(&exists)
 	return exists, err
 }
 

@@ -36,6 +36,7 @@ func main() {
 		count       = flag.Int64("count", 10, "Max messages per fetch")
 		reclaimIdle = flag.Duration("reclaim-idle", 5*time.Second, "Reclaim pending messages idle at least this long, from any consumer (picks up work orphaned by a crashed worker)")
 		httpAddr    = flag.String("http", ":8080", "Address to serve the dashboard (/) and Prometheus metrics (/metrics) on; empty disables it")
+		maxMessages = flag.Int("max-messages", 0, "Exit after processing this many messages (0 = run forever)")
 
 		authToken      = flag.String("auth-token", os.Getenv("WORKFLOW_DASHBOARD_TOKEN"), "Bearer token required on every dashboard/metrics request; empty disables auth (fine for local dev, NOT for a public deployment). Defaults to $WORKFLOW_DASHBOARD_TOKEN so it doesn't need to appear on the command line.")
 		rateLimitRPS   = flag.Float64("rate-limit-rps", 5, "Sustained requests/sec allowed across all clients on the dashboard/metrics server; <=0 disables rate limiting")
@@ -43,6 +44,9 @@ func main() {
 
 		faultSaga = flag.Bool("fault-saga", false, "Run a single hardcoded 2-success+1-failure saga directly (bypassing the queue) to exercise Saga compensation, then exit. Used by cmd/faultinject.")
 		wfIDFlag  = flag.String("wf-id", "", "Workflow ID for -fault-saga (required); reuse the same ID across a crash and its replacement run to resume compensation")
+
+		metalswBin      = flag.String("metalsw-bin", "", "Path to metalsw's compiled gpu_main binary; metalsw step registered only if set")
+		metalswMetallib = flag.String("metalsw-metallib", "smith_waterman.metallib", "Path to metalsw's compiled Metal shader library")
 	)
 	flag.Parse()
 
@@ -63,6 +67,25 @@ func main() {
 	for _, step := range steps.OrderSagaSteps() {
 		registry.Register(step)
 	}
+	if *metalswBin != "" {
+		registry.Register(steps.NewMetalSWStep(*metalswBin, *metalswMetallib))
+	}
+	// Register notification step (confidence-gated, idempotent)
+	notificationConfig := steps.NotificationConfig{
+		ConfidenceThreshold: 0.7, // Only notify if confidence >= 70%
+		Channels:            []string{"email", "webhook"},
+		EmailConfig: &steps.EmailNotificationConfig{
+			To:      []string{"research-team@example.com"},
+			Subject: "Research Workflow Complete: {{.workflow_id}}",
+			Body:    "Workflow {{.workflow_id}} completed with confidence {{.confidence}}",
+		},
+		WebhookConfig: &steps.WebhookNotificationConfig{
+			URL:    "https://webhook.example.com/notify",
+			Method: "POST",
+			Body:   `{"workflow_id": "{{.workflow_id}}", "confidence": {{.confidence}}}`,
+		},
+	}
+	registry.Register(steps.NewNotificationStep("send_notification", notificationConfig, s))
 
 	if *faultSaga {
 		wfID, err := uuid.Parse(*wfIDFlag)
@@ -121,7 +144,7 @@ func main() {
 		go func(id int) {
 			defer wg.Done()
 			consumerName := *workerID + "-" + string(rune('a'+id))
-			runWorker(ctx, e, q, consumerName, *blockTime, *count, *reclaimIdle)
+			runWorker(ctx, e, q, consumerName, *blockTime, *count, *reclaimIdle, *maxMessages)
 		}(i)
 	}
 
@@ -155,12 +178,16 @@ func runFaultSaga(ctx context.Context, e *engine.Engine, wfID uuid.UUID) {
 	}
 }
 
-func runWorker(ctx context.Context, e *engine.Engine, q *queue.Client, consumer string, block time.Duration, count int64, reclaimIdle time.Duration) {
+func runWorker(ctx context.Context, e *engine.Engine, q *queue.Client, consumer string, block time.Duration, count int64, reclaimIdle time.Duration, maxMessages int) {
+	messagesProcessed := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			if maxMessages > 0 && messagesProcessed >= maxMessages {
+				return
+			}
 			// Pick up any message left pending by a consumer that crashed
 			// before acking it, so crash recovery doesn't depend on a
 			// specific consumer name coming back. Handle these right away:
@@ -172,7 +199,11 @@ func runWorker(ctx context.Context, e *engine.Engine, q *queue.Client, consumer 
 			if err != nil {
 				log.Printf("Worker %s: reclaim error: %v", consumer, err)
 			}
-			processMessages(ctx, e, q, consumer, reclaimed)
+			processed := processMessages(ctx, e, q, consumer, reclaimed)
+			messagesProcessed += processed
+			if maxMessages > 0 && messagesProcessed >= maxMessages {
+				return
+			}
 
 			msgs, err := q.ConsumeSteps(ctx, consumer, count, block)
 			if err != nil {
@@ -180,12 +211,20 @@ func runWorker(ctx context.Context, e *engine.Engine, q *queue.Client, consumer 
 				time.Sleep(time.Second)
 				continue
 			}
-			processMessages(ctx, e, q, consumer, msgs)
+			if len(msgs) == 0 {
+				continue
+			}
+			processed = processMessages(ctx, e, q, consumer, msgs)
+			messagesProcessed += processed
+			if maxMessages > 0 && messagesProcessed >= maxMessages {
+				return
+			}
 		}
 	}
 }
 
-func processMessages(ctx context.Context, e *engine.Engine, q *queue.Client, consumer string, msgs []redis.XMessage) {
+func processMessages(ctx context.Context, e *engine.Engine, q *queue.Client, consumer string, msgs []redis.XMessage) int {
+	processed := 0
 	for _, msg := range msgs {
 		stepMsg, err := queue.ParseStepMessage(msg)
 		if err != nil {
@@ -202,7 +241,12 @@ func processMessages(ctx context.Context, e *engine.Engine, q *queue.Client, con
 		faultinject.Crash("after_log_before_ack")
 
 		if err := q.Ack(ctx, msg.ID); err != nil {
+			// Leave the message pending so a reclaim can retry the ack;
+			// don't count it toward maxMessages.
 			log.Printf("Worker %s: ack error: %v", consumer, err)
+			return processed
 		}
+		processed++
 	}
+	return processed
 }

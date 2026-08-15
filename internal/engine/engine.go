@@ -207,6 +207,276 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, wfID uuid.UUID, wfDef *Wor
 	return wfID, nil
 }
 
+// StepRouter decides the next step name and input based on the previous
+// step's output. Return (nil, nil) to signal workflow completion.
+type StepRouter func(ctx context.Context, wfID uuid.UUID, previousStepName string, previousOutput map[string]any) (nextStepName string, nextInput map[string]any, err error)
+
+// AgenticWorkflowConfig configures an agentic (dynamic) workflow execution.
+type AgenticWorkflowConfig struct {
+	StartStepName string
+	StartInput    map[string]any
+	Router        StepRouter
+	MaxSteps      int                  // safety limit to prevent infinite loops (default 100)
+	RouterCache   *RouterDecisionCache // optional cache for routing decisions
+}
+
+// RouterDecisionCache caches routing decisions to avoid re-asking a model
+// for the same (wfID, stepName, stepInput) context. It is safe for concurrent
+// use.
+type RouterDecisionCache struct {
+	mu    sync.Mutex
+	cache map[string]RouterDecision
+}
+
+type RouterDecision struct {
+	NextStepName string
+	NextInput    map[string]any
+}
+
+// NewRouterDecisionCache creates a new empty router decision cache.
+func NewRouterDecisionCache() *RouterDecisionCache {
+	return &RouterDecisionCache{cache: make(map[string]RouterDecision)}
+}
+
+func (c *RouterDecisionCache) decisionKey(stepName string, stepInput map[string]any) (string, error) {
+	inputBytes, err := json.Marshal(stepInput)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s|%s", stepName, string(inputBytes)), nil
+}
+
+// Get returns the cached decision if present, or (nil, false) if not cached.
+func (c *RouterDecisionCache) Get(stepName string, stepInput map[string]any) (RouterDecision, bool, error) {
+	key, err := c.decisionKey(stepName, stepInput)
+	if err != nil {
+		return RouterDecision{}, false, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	decision, ok := c.cache[key]
+	return decision, ok, nil
+}
+
+// Set caches a routing decision.
+func (c *RouterDecisionCache) Set(stepName string, stepInput map[string]any, decision RouterDecision) error {
+	key, err := c.decisionKey(stepName, stepInput)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache[key] = decision
+	return nil
+}
+
+// CachedRouter wraps a StepRouter with a RouterDecisionCache. If a decision
+// for the given context is cached, it returns the cached decision without
+// calling the underlying router. Otherwise, it calls the router and caches
+// the result.
+func CachedRouter(router StepRouter, cache *RouterDecisionCache) StepRouter {
+	return func(ctx context.Context, wfID uuid.UUID, previousStepName string, previousOutput map[string]any) (string, map[string]any, error) {
+		if cache == nil {
+			return router(ctx, wfID, previousStepName, previousOutput)
+		}
+		decision, ok, err := cache.Get(previousStepName, previousOutput)
+		if err != nil {
+			return "", nil, err
+		}
+		if ok {
+			return decision.NextStepName, decision.NextInput, nil
+		}
+		nextStepName, nextInput, err := router(ctx, wfID, previousStepName, previousOutput)
+		if err != nil {
+			return "", nil, err
+		}
+		if err := cache.Set(previousStepName, previousOutput, RouterDecision{
+			NextStepName: nextStepName,
+			NextInput:    nextInput,
+		}); err != nil {
+			return "", nil, err
+		}
+		return nextStepName, nextInput, nil
+	}
+}
+
+// ExecuteAgentic runs a workflow where the next step is decided at runtime
+// by the Router function, based on the previous step's output. It reuses
+// the same exactly-once/idempotency/event-log machinery as ExecuteWorkflow.
+// If RouterCache is provided, routing decisions are cached and replayed
+// for identical contexts, avoiding re-asking a model.
+func (e *Engine) ExecuteAgentic(ctx context.Context, wfID uuid.UUID, cfg AgenticWorkflowConfig) (uuid.UUID, error) {
+	if cfg.Router == nil {
+		return uuid.Nil, errors.New("engine: agentic workflow requires a Router function")
+	}
+	if cfg.StartStepName == "" {
+		return uuid.Nil, errors.New("engine: agentic workflow requires a StartStepName")
+	}
+	maxSteps := cfg.MaxSteps
+	if maxSteps <= 0 {
+		maxSteps = 100
+	}
+
+	// Wrap router with cache if provided
+	router := cfg.Router
+	if cfg.RouterCache != nil {
+		router = CachedRouter(cfg.Router, cfg.RouterCache)
+	}
+
+	// Create workflow record (idempotent: a resumed run reuses the same ID)
+	if err := e.store.CreateWorkflow(ctx, wfID, "agentic-"+cfg.StartStepName, mustMarshal(cfg.StartInput)); err != nil {
+		return uuid.Nil, fmt.Errorf("engine: create workflow: %w", err)
+	}
+
+	plan := saga.NewCompensationPlan()
+	stepName := cfg.StartStepName
+	stepInput := cfg.StartInput
+
+	for stepCount := 0; stepCount < maxSteps; stepCount++ {
+		dedupKey, err := idempotency.DedupKey(wfID.String(), stepName, stepInput)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("engine: dedup key for %s: %w", stepName, err)
+		}
+
+		// Check if already completed (crash recovery)
+		completed, err := e.store.HasCompleted(ctx, dedupKey)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("engine: check completion: %w", err)
+		}
+		if completed {
+			// Replay: find the output from event log
+			output, err := e.getStepOutput(ctx, wfID, stepName)
+			if err != nil {
+				return uuid.Nil, fmt.Errorf("engine: get step output: %w", err)
+			}
+			if step, ok := e.registry.Get(stepName); ok {
+				plan.AddStep(stepName, output, dedupKey, step.Compensate)
+			} else {
+				plan.AddStep(stepName, output, dedupKey, nil)
+			}
+
+			// Ask router for next step based on replayed output
+			nextName, nextInput, err := router(ctx, wfID, stepName, output)
+			if err != nil {
+				return uuid.Nil, fmt.Errorf("engine: router error: %w", err)
+			}
+			if nextName == "" {
+				break // workflow complete
+			}
+			stepName = nextName
+			stepInput = nextInput
+			continue
+		}
+
+		// Record step started
+		_, err = e.store.AppendEvent(ctx, store.Event{
+			WorkflowID: wfID,
+			StepName:   stepName,
+			Type:       store.EventStepStarted,
+			DedupKey:   dedupKey,
+			Payload:    mustMarshal(stepInput),
+		})
+		if err != nil {
+			if errors.Is(err, store.ErrDuplicateEvent) {
+				// Another worker started it, wait and check completion
+				output, err := e.getStepOutput(ctx, wfID, stepName)
+				if err != nil {
+					return uuid.Nil, err
+				}
+				if step, ok := e.registry.Get(stepName); ok {
+					plan.AddStep(stepName, output, dedupKey, step.Compensate)
+				} else {
+					plan.AddStep(stepName, output, dedupKey, nil)
+				}
+
+				nextName, nextInput, err := router(ctx, wfID, stepName, output)
+				if err != nil {
+					return uuid.Nil, fmt.Errorf("engine: router error: %w", err)
+				}
+				if nextName == "" {
+					break
+				}
+				stepName = nextName
+				stepInput = nextInput
+				continue
+			}
+			return uuid.Nil, fmt.Errorf("engine: record step started: %w", err)
+		}
+
+		// Execute step business logic
+		step, ok := e.registry.Get(stepName)
+		if !ok {
+			return uuid.Nil, fmt.Errorf("%w: %s", ErrStepNotRegistered, stepName)
+		}
+
+		faultinject.Crash("before_execution")
+
+		output, execErr := step.Execute(ctx, stepInput)
+		if execErr != nil {
+			// Record failure
+			_, _ = e.store.AppendEvent(ctx, store.Event{
+				WorkflowID: wfID,
+				StepName:   stepName,
+				Type:       store.EventStepFailed,
+				DedupKey:   dedupKey,
+				Payload:    mustMarshal(map[string]any{"error": execErr.Error()}),
+			})
+			_ = e.store.UpdateWorkflowStatus(ctx, wfID, store.StatusFailed)
+
+			// Trigger compensation for completed steps
+			_ = plan.ExecuteCompensation(ctx, e.store, wfID)
+			_ = e.store.UpdateWorkflowStatus(ctx, wfID, store.StatusCompensated)
+
+			return uuid.Nil, fmt.Errorf("engine: execute step %s: %w", stepName, execErr)
+		}
+
+		faultinject.Crash("after_completion_before_log")
+
+		// Record step completed (idempotent via dedup key unique index)
+		_, err = e.store.AppendEvent(ctx, store.Event{
+			WorkflowID: wfID,
+			StepName:   stepName,
+			Type:       store.EventStepCompleted,
+			DedupKey:   dedupKey,
+			Payload:    mustMarshal(output),
+		})
+		if err != nil {
+			if errors.Is(err, store.ErrDuplicateEvent) {
+				// Another worker completed it concurrently
+				output, _ = e.getStepOutput(ctx, wfID, stepName)
+			} else {
+				return uuid.Nil, fmt.Errorf("engine: record step completed: %w", err)
+			}
+		}
+
+		plan.AddStep(stepName, output, dedupKey, step.Compensate)
+
+		// Ask router for next step
+		nextName, nextInput, err := router(ctx, wfID, stepName, output)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("engine: router error: %w", err)
+		}
+		if nextName == "" {
+			// Workflow complete
+			break
+		}
+		stepName = nextName
+		stepInput = nextInput
+	}
+
+	// Workflow completed successfully
+	_ = e.store.UpdateWorkflowStatus(ctx, wfID, store.StatusCompleted)
+	_, _ = e.store.AppendEvent(ctx, store.Event{
+		WorkflowID: wfID,
+		StepName:   "",
+		Type:       store.EventWorkflowCompleted,
+		DedupKey:   "",
+		Payload:    mustMarshal(stepInput),
+	})
+
+	return wfID, nil
+}
+
 // ProcessStep pulls a step from the queue and executes it (worker mode).
 // It follows the same exactly-once sequence as ExecuteWorkflow: check for a
 // prior completion, record that execution started, run the step's business
