@@ -16,16 +16,18 @@ import (
 // for a completion event type (compensation_completed) under an
 // already-used dedup key returns store.ErrDuplicateEvent.
 type fakeEventLog struct {
-	mu        sync.Mutex
-	events    map[uuid.UUID][]store.Event
-	completed map[string]bool
-	nextID    int64
+	mu            sync.Mutex
+	events        map[uuid.UUID][]store.Event
+	completed     map[string]bool
+	notifications map[string]bool
+	nextID        int64
 }
 
 func newFakeEventLog() *fakeEventLog {
 	return &fakeEventLog{
-		events:    make(map[uuid.UUID][]store.Event),
-		completed: make(map[string]bool),
+		events:        make(map[uuid.UUID][]store.Event),
+		completed:     make(map[string]bool),
+		notifications: make(map[string]bool),
 	}
 }
 
@@ -47,6 +49,12 @@ func (f *fakeEventLog) AppendEvent(ctx context.Context, e store.Event) (store.Ev
 		}
 		f.completed[e.DedupKey] = true
 	}
+	if e.Type == store.EventNotificationSent {
+		if f.notifications[e.DedupKey] {
+			return store.Event{}, store.ErrDuplicateEvent
+		}
+		f.notifications[e.DedupKey] = true
+	}
 
 	f.nextID++
 	e.ID = f.nextID
@@ -58,6 +66,12 @@ func (f *fakeEventLog) HasCompleted(ctx context.Context, dedupKey string) (bool,
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.completed[dedupKey], nil
+}
+
+func (f *fakeEventLog) HasNotificationSent(ctx context.Context, dedupKey string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.notifications[dedupKey], nil
 }
 
 func (f *fakeEventLog) ReplayEvents(ctx context.Context, workflowID uuid.UUID) ([]store.Event, error) {
