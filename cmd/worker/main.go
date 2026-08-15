@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/srikarjy/workflow_engine/internal/dashboard"
 	"github.com/srikarjy/workflow_engine/internal/engine"
 	"github.com/srikarjy/workflow_engine/internal/faultinject"
 	"github.com/srikarjy/workflow_engine/internal/queue"
@@ -33,6 +35,11 @@ func main() {
 		blockTime   = flag.Duration("block", 5*time.Second, "Block time for XREADGROUP")
 		count       = flag.Int64("count", 10, "Max messages per fetch")
 		reclaimIdle = flag.Duration("reclaim-idle", 5*time.Second, "Reclaim pending messages idle at least this long, from any consumer (picks up work orphaned by a crashed worker)")
+		httpAddr    = flag.String("http", ":8080", "Address to serve the dashboard (/) and Prometheus metrics (/metrics) on; empty disables it")
+
+		authToken      = flag.String("auth-token", os.Getenv("WORKFLOW_DASHBOARD_TOKEN"), "Bearer token required on every dashboard/metrics request; empty disables auth (fine for local dev, NOT for a public deployment). Defaults to $WORKFLOW_DASHBOARD_TOKEN so it doesn't need to appear on the command line.")
+		rateLimitRPS   = flag.Float64("rate-limit-rps", 5, "Sustained requests/sec allowed across all clients on the dashboard/metrics server; <=0 disables rate limiting")
+		rateLimitBurst = flag.Int("rate-limit-burst", 20, "Burst allowance above -rate-limit-rps")
 
 		faultSaga = flag.Bool("fault-saga", false, "Run a single hardcoded 2-success+1-failure saga directly (bypassing the queue) to exercise Saga compensation, then exit. Used by cmd/faultinject.")
 		wfIDFlag  = flag.String("wf-id", "", "Workflow ID for -fault-saga (required); reuse the same ID across a crash and its replacement run to resume compensation")
@@ -91,6 +98,21 @@ func main() {
 	}
 
 	e := engine.NewEngine(s, q, *workerID, registry)
+
+	if *httpAddr != "" {
+		if *authToken == "" {
+			log.Printf("WARNING: -auth-token / $WORKFLOW_DASHBOARD_TOKEN is unset — the dashboard and /metrics are unauthenticated. Fine for local dev, not for a public deployment.")
+		}
+		cfg := dashboard.Config{AuthToken: *authToken, RateLimitRPS: *rateLimitRPS, RateLimitBurst: *rateLimitBurst}
+		srv := &http.Server{Addr: *httpAddr, Handler: dashboard.Handler(s, cfg)}
+		go func() {
+			log.Printf("dashboard and metrics listening on %s", *httpAddr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("http server error: %v", err)
+			}
+		}()
+		defer srv.Close()
+	}
 
 	// Start worker pool
 	var wg sync.WaitGroup

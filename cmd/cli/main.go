@@ -12,14 +12,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/cobra"
 
+	"github.com/srikarjy/workflow_engine/internal/engine"
 	"github.com/srikarjy/workflow_engine/internal/store"
+	"github.com/srikarjy/workflow_engine/internal/workflowdef"
 )
 
 func main() {
 	var postgresDSN string
 	var rootCmd = &cobra.Command{
-		Use:   "workflow-cli",
-		Short: "Workflow engine CLI",
+		Use:           "workflow-cli",
+		Short:         "Workflow engine CLI",
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			var err error
 			pool, err = pgxpool.New(context.Background(), postgresDSN)
@@ -113,28 +117,82 @@ func main() {
 		Short: "List workflows",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
-			rows, err := pool.Query(ctx, `SELECT id, name, status, created_at FROM workflows ORDER BY created_at DESC LIMIT 50`)
+			s, err := store.New(ctx, postgresDSN)
 			if err != nil {
 				return err
 			}
-			defer rows.Close()
+			defer s.Close()
+
+			workflows, err := s.ListWorkflows(ctx, 50)
+			if err != nil {
+				return err
+			}
 
 			fmt.Println("ID                                    | NAME        | STATUS       | CREATED")
 			fmt.Println("--------------------------------------|-------------|--------------|---------------------")
-			for rows.Next() {
-				var id uuid.UUID
-				var name, status string
-				var created string
-				if err := rows.Scan(&id, &name, &status, &created); err != nil {
-					return err
-				}
-				fmt.Printf("%s | %-11s | %-12s | %s\n", id.String(), name, status, created)
+			for _, w := range workflows {
+				fmt.Printf("%s | %-11s | %-12s | %s\n", w.ID.String(), w.Name, w.Status, w.CreatedAt)
 			}
 			return nil
 		},
 	}
 
-	rootCmd.AddCommand(createCmd, statusCmd, listCmd)
+	var runCmd = &cobra.Command{
+		Use:   "run",
+		Short: "Run a YAML workflow definition to completion (or compensation on failure)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			workflowFile, _ := cmd.Flags().GetString("workflow")
+			inputFile, _ := cmd.Flags().GetString("input")
+			resume, _ := cmd.Flags().GetString("resume")
+
+			def, err := workflowdef.Load(workflowFile)
+			if err != nil {
+				return err
+			}
+
+			var input map[string]any
+			if inputFile != "" {
+				data, err := os.ReadFile(inputFile)
+				if err != nil {
+					return err
+				}
+				if err := json.Unmarshal(data, &input); err != nil {
+					return err
+				}
+			}
+
+			wfID := uuid.New()
+			if resume != "" {
+				wfID, err = uuid.Parse(resume)
+				if err != nil {
+					return fmt.Errorf("--resume: %w", err)
+				}
+			}
+
+			ctx := context.Background()
+			s, err := store.New(ctx, postgresDSN)
+			if err != nil {
+				return err
+			}
+			defer s.Close()
+
+			e := engine.NewEngine(s, nil, "cli-run", nil)
+			fmt.Printf("running workflow %s (%s)\n", wfID, def.Name)
+			_, err = e.ExecuteWorkflow(ctx, wfID, def.Build(), input)
+			if err != nil {
+				fmt.Printf("workflow %s failed and compensated: %v\n", wfID, err)
+				return err
+			}
+			fmt.Printf("workflow %s completed\n", wfID)
+			return nil
+		},
+	}
+	runCmd.Flags().String("workflow", "", "YAML workflow definition file (required)")
+	runCmd.Flags().String("input", "", "JSON file with workflow input")
+	runCmd.Flags().String("resume", "", "Resume a previously started workflow by ID instead of starting a new one")
+	_ = runCmd.MarkFlagRequired("workflow")
+
+	rootCmd.AddCommand(createCmd, statusCmd, listCmd, runCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)

@@ -1,0 +1,10 @@
+{
+  "order_id": "order-1234",
+  "items": [
+    {"product_id": "SKU-001", "quantity": 2},
+    {"product_id": "SKU-002", "quantity": 1}
+  ],
+  "amount_cents": 2999,
+  "currency": "USD",
+  "email": "customer@example.com"
+}

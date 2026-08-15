@@ -10,10 +10,11 @@ import (
 // expected number of times — the whole point of exactly-once execution) and
 // can be configured to fail, to exercise the failure/compensation paths.
 type spyStep struct {
-	name       string
-	failWith   error
-	execCount  atomic.Int32
-	outputFunc func(input map[string]any) map[string]any
+	name            string
+	failWith        error
+	execCount       atomic.Int32
+	compensateCount atomic.Int32
+	outputFunc      func(input map[string]any) map[string]any
 }
 
 func (s *spyStep) Name() string { return s.name }
@@ -34,8 +35,13 @@ func (s *spyStep) Execute(ctx context.Context, input map[string]any) (map[string
 	return out, nil
 }
 
-func (s *spyStep) Compensate(ctx context.Context, output map[string]any) error { return nil }
+func (s *spyStep) Compensate(ctx context.Context, output map[string]any) error {
+	s.compensateCount.Add(1)
+	return nil
+}
 
 func (s *spyStep) calls() int { return int(s.execCount.Load()) }
+
+func (s *spyStep) compensateCalls() int { return int(s.compensateCount.Load()) }
 
 var errForced = errors.New("forced failure")

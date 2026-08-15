@@ -8,11 +8,11 @@ Built in **Go** to demonstrate the low-level primitives that production workflow
 
 ## Features
 
-- Executes multi-step workflows with configurable per-step retry policies.
-- Supports exponential backoff with jitter for transient failures.
+- Define workflows as **YAML**, no Go required: each step is an HTTP call against your own services (see [Workflow Definitions](#workflow-definitions)).
+- Executes multi-step workflows with configurable per-step retry policies, exponential backoff, and jitter for transient failures (`internal/httpstep`).
 - Guarantees idempotent execution using SHA-256 deduplication keys derived from deterministic step inputs.
 - Recovers from worker crashes (`SIGKILL`) by replaying an append-only PostgreSQL event log without double-executing completed steps.
-- Implements reverse-order Saga compensation with durable checkpointing before and after every compensation step.
+- Implements reverse-order Saga compensation: on failure, each completed step's real rollback HTTP call is invoked (not just logged), most-recent-first, with durable checkpointing before and after every compensation step.
 - Provides workflow inspection through both a CLI and lightweight HTTP dashboard.
 - Exposes Prometheus metrics for monitoring and benchmarking.
 
@@ -28,8 +28,9 @@ Built in **Go** to demonstrate the low-level primitives that production workflow
 | CLI | Cobra | `spf13/cobra` |
 | HTTP Dashboard | Go stdlib | `net/http`, `html/template` |
 | Metrics | Prometheus | `prometheus/client_golang` |
-| Testing | Testify, Testcontainers | `stretchr/testify`, `testcontainers-go` |
+| Testing | Go stdlib `testing`, in-memory fakes | `internal/*/fake_store_test.go` |
 | Migrations | golang-migrate | `golang-migrate/migrate` |
+| Workflow definitions | YAML | `gopkg.in/yaml.v3` |
 
 ---
 
@@ -158,16 +159,21 @@ docker compose up -d
 go run ./cmd/migrate up
 ```
 
-### 3. Start the worker
+### 3. Start the worker (dashboard + metrics)
 
 ```bash
 go run ./cmd/worker
 ```
 
-### 4. Submit a workflow
+### 4. Start a target service and run the example workflow
+
+`examples/order-saga.yaml` calls out to a small demo HTTP service
+(`cmd/exampleservice`) that stands in for your real order-fulfillment
+endpoints — swap its URLs for your own services to run a real workflow.
 
 ```bash
-go run ./cmd/cli create --file ./examples/order-saga.json
+go run ./cmd/exampleservice &
+go run ./cmd/cli run --workflow examples/order-saga.yaml --input examples/order-input.json
 ```
 
 ### 5. Inspect workflow state
@@ -176,11 +182,101 @@ go run ./cmd/cli create --file ./examples/order-saga.json
 go run ./cmd/cli status --id <workflow-id>
 ```
 
-### 6. View Prometheus metrics
+### 6. View the dashboard and Prometheus metrics
+
+The worker serves both on the address given by `-http` (default `:8080`):
 
 ```
-http://localhost:8080/metrics
+http://localhost:8080/               # workflow list
+http://localhost:8080/workflows/<id> # workflow detail: status + full event log
+http://localhost:8080/metrics        # Prometheus metrics
 ```
+
+Metrics exported: `workflow_steps_started_total`, `workflow_steps_completed_total`,
+`workflow_steps_failed_total`, `workflow_steps_skipped_duplicate_total`,
+`workflow_step_duration_seconds`, `workflow_compensations_started_total`,
+`workflow_compensations_completed_total` — all labeled by step name, alongside
+the standard Go runtime collectors.
+
+### Securing a public deployment
+
+By default the dashboard and `/metrics` are open (fine for `localhost`).
+Before exposing the worker's `-http` port publicly, set:
+
+```bash
+export WORKFLOW_DASHBOARD_TOKEN=<some-random-secret>
+go run ./cmd/worker  # -auth-token also works if you'd rather not use an env var
+```
+
+Every request then requires `Authorization: Bearer <token>` or gets `401`.
+A shared, global rate limit (`-rate-limit-rps` / `-rate-limit-burst`,
+default 5 rps / burst 20 across all clients combined) returns `429` once
+exceeded, so a public URL can't be hammered into runaway compute or
+database load. Leaving `WORKFLOW_DASHBOARD_TOKEN` unset logs a startup
+warning rather than failing silently.
+
+---
+
+# Workflow Definitions
+
+A workflow is a YAML file: a name, an ordered list of steps, and an optional
+default retry policy. Each step is an HTTP call — the engine POSTs the
+current input as the JSON request body and treats the JSON response body as
+the step's output, which becomes the next step's input. A non-2xx response
+or network error triggers a retry (per policy) and, once retries are
+exhausted, Saga compensation of every step that already completed.
+
+```yaml
+name: order-saga
+
+retry:                       # default for any step that doesn't set its own
+  max_attempts: 3
+  initial_backoff: 100ms
+  max_backoff: 2s
+  jitter: true
+
+steps:
+  - name: reserve_inventory
+    execute:
+      method: POST
+      url: http://localhost:9090/reserve
+      timeout: 5s
+    compensate:               # called (for real, not just logged) if a
+      method: POST             # later step fails
+      url: http://localhost:9090/release
+
+  - name: charge_payment
+    execute: {method: POST, url: http://localhost:9090/charge}
+    compensate: {method: POST, url: http://localhost:9090/refund}
+    retry: {max_attempts: 5}   # per-step override
+
+  - name: update_analytics
+    execute: {method: POST, url: http://localhost:9090/analytics}
+    # no `compensate`: some steps (an analytics event) have nothing to undo
+```
+
+Run it against real Postgres, with full crash-recoverable execution and
+Saga compensation on failure (this is `engine.ExecuteWorkflow` — the same
+code path proven by the fault-injection results below, not a separate
+"simple mode"):
+
+```bash
+go run ./cmd/cli run --workflow <file.yaml> --input <input.json> [--resume <workflow-id>]
+```
+
+`--resume` reuses a previous workflow ID (e.g. after a crash) instead of
+starting a new run — every step already completed is skipped via the same
+dedup-key check the worker uses.
+
+**Retry, verified live** (not just unit-tested — see `internal/httpstep`
+for the retry loop and its tests): pointing a step's URL at
+`cmd/exampleservice`'s `?fail=N` query param (fails the first N requests to
+that path, then succeeds) and running with `max_attempts: 3` shows two
+`503`s in the service log followed by a success, and the workflow completes
+normally. Setting `fail` above `max_attempts` instead exhausts the retry
+budget, and the workflow's real compensation calls (e.g. `/release`) fire —
+confirmed by grepping the example service's request log, not just checking
+the event log for `compensation_completed` rows.
 
 ---
 
@@ -217,16 +313,19 @@ This makes retries and crash recovery safe by construction.
 
 ## Durable Saga Compensation
 
-Compensation operations are modeled as first-class workflow steps.
+When a step fails, the engine walks every already-completed step in reverse
+order and, for each one, actually invokes its rollback logic (its
+`StepExecutor.Compensate` — an HTTP call to the `compensate` URL for
+YAML-defined steps) between two durably persisted checkpoints:
 
-Each compensation records:
+1. `compensation_started`
+2. `compensation_completed` — written only after the rollback call itself
+   succeeds; if it fails, the error is returned and only the `started`
+   event exists, so a resumed run retries the same rollback call rather
+   than silently marking it done.
 
-1. Compensation started
-2. Compensation completed
-
-Both events are durably persisted.
-
-If a worker crashes during rollback, the next worker resumes compensation from the exact unfinished step.
+If a worker crashes during rollback, the next worker resumes compensation
+from the exact unfinished step.
 
 ---
 
@@ -255,19 +354,24 @@ Understanding these mechanisms makes it easier to reason about how production or
 ```text
 .
 ├── cmd/
-│   ├── worker/          # Worker pool daemon
-│   ├── cli/             # CLI inspection tool
+│   ├── worker/          # Worker pool daemon (dashboard + metrics HTTP server)
+│   ├── cli/             # CLI: create/status/list/run
 │   ├── migrate/         # Database migrations
-│   └── faultinject/     # SIGKILL fault injection harness
+│   ├── faultinject/     # SIGKILL fault injection harness
+│   └── exampleservice/  # Throwaway HTTP target for examples/order-saga.yaml
 │
 ├── internal/
 │   ├── engine/          # Workflow execution engine
 │   ├── store/           # PostgreSQL event log
 │   ├── queue/           # Redis Streams consumer
 │   ├── saga/            # Compensation engine
-│   └── idempotency/     # Deduplication key generation
+│   ├── idempotency/     # Deduplication key generation
+│   ├── httpstep/        # HTTP-backed StepExecutor with retry/backoff
+│   ├── workflowdef/     # YAML workflow definition parsing
+│   ├── dashboard/       # HTTP workflow list/detail views
+│   └── metrics/         # Prometheus metric definitions
 │
-├── examples/            # Sample workflow definitions
+├── examples/            # order-saga.yaml + order-input.json
 ├── docker-compose.yml
 └── README.md
 ```

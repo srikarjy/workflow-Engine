@@ -247,4 +247,13 @@ func TestExecuteWorkflow_FailureCompensatesCompletedStepsInReverseOrder(t *testi
 	if step3.calls() != 1 {
 		t.Errorf("failing step executed %d times, want 1", step3.calls())
 	}
+
+	// Guards against compensation being log-only: the steps' actual
+	// Compensate logic (not just the compensation_* events) must run.
+	if step1.compensateCalls() != 1 {
+		t.Errorf("step1.Compensate called %d times, want 1", step1.compensateCalls())
+	}
+	if step2.compensateCalls() != 1 {
+		t.Errorf("step2.Compensate called %d times, want 1", step2.compensateCalls())
+	}
 }

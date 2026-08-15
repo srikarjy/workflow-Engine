@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 
 	"github.com/srikarjy/workflow_engine/internal/faultinject"
 	"github.com/srikarjy/workflow_engine/internal/idempotency"
+	"github.com/srikarjy/workflow_engine/internal/metrics"
 	"github.com/srikarjy/workflow_engine/internal/store"
 )
 
@@ -26,9 +28,10 @@ type CompensationPlan struct {
 }
 
 type ExecutedStep struct {
-	Name     string
-	Output   map[string]any
-	DedupKey string
+	Name       string
+	Output     map[string]any
+	DedupKey   string
+	Compensate func(ctx context.Context, output map[string]any) error
 }
 
 // NewCompensationPlan creates an empty compensation plan.
@@ -37,11 +40,16 @@ func NewCompensationPlan() *CompensationPlan {
 }
 
 // AddStep records a successfully executed step for potential compensation.
-func (p *CompensationPlan) AddStep(name string, output map[string]any, dedupKey string) {
+// compensate is the step's actual rollback logic (e.g. a StepExecutor's
+// Compensate method); ExecuteCompensation calls it, not just log events —
+// nil is treated as a no-op rollback (some steps, like an analytics event,
+// have nothing to undo).
+func (p *CompensationPlan) AddStep(name string, output map[string]any, dedupKey string, compensate func(ctx context.Context, output map[string]any) error) {
 	p.steps = append(p.steps, ExecutedStep{
-		Name:     name,
-		Output:   output,
-		DedupKey: dedupKey,
+		Name:       name,
+		Output:     output,
+		DedupKey:   dedupKey,
+		Compensate: compensate,
 	})
 }
 
@@ -85,6 +93,13 @@ func (p *CompensationPlan) ExecuteCompensation(ctx context.Context, s store.Even
 			}
 			return err
 		}
+		metrics.CompensationsStarted.WithLabelValues(step.Name).Inc()
+
+		if step.Compensate != nil {
+			if err := step.Compensate(ctx, step.Output); err != nil {
+				return fmt.Errorf("saga: compensate %s: %w", step.Name, err)
+			}
+		}
 
 		if i == len(steps)-1 {
 			faultinject.Crash("during_final_compensation")
@@ -105,6 +120,7 @@ func (p *CompensationPlan) ExecuteCompensation(ctx context.Context, s store.Even
 			}
 			return err
 		}
+		metrics.CompensationsCompleted.WithLabelValues(step.Name).Inc()
 	}
 	return nil
 }

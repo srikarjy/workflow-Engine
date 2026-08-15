@@ -129,6 +129,28 @@ func (s *Store) UpdateWorkflowStatus(ctx context.Context, id uuid.UUID, status W
 	return err
 }
 
+// ListWorkflows returns the most recently created workflows, newest first.
+func (s *Store) ListWorkflows(ctx context.Context, limit int) ([]Workflow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, name, status, input, created_at, updated_at
+		FROM workflows ORDER BY created_at DESC LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var workflows []Workflow
+	for rows.Next() {
+		var w Workflow
+		if err := rows.Scan(&w.ID, &w.Name, &w.Status, &w.Input, &w.CreatedAt, &w.UpdatedAt); err != nil {
+			return nil, err
+		}
+		workflows = append(workflows, w)
+	}
+	return workflows, rows.Err()
+}
+
 // AppendEvent writes an event to the log. For completion event types
 // (EventStepCompleted, EventCompensationCompleted), a unique index on
 // dedup_key enforces exactly-once at the database level: if another

@@ -1,0 +1,57 @@
+name: order-saga
+
+# Applies to any step below that doesn't set its own `retry`.
+retry:
+  max_attempts: 3
+  initial_backoff: 100ms
+  max_backoff: 2s
+  jitter: true
+
+steps:
+  - name: reserve_inventory
+    execute:
+      method: POST
+      url: http://localhost:9090/reserve
+      timeout: 5s
+    compensate:
+      method: POST
+      url: http://localhost:9090/release
+
+  - name: charge_payment
+    execute:
+      method: POST
+      url: http://localhost:9090/charge
+      timeout: 5s
+    compensate:
+      method: POST
+      url: http://localhost:9090/refund
+    retry:
+      max_attempts: 5
+      initial_backoff: 100ms
+      max_backoff: 2s
+      jitter: true
+
+  - name: create_shipment
+    execute:
+      method: POST
+      url: http://localhost:9090/ship
+      timeout: 5s
+    compensate:
+      method: POST
+      url: http://localhost:9090/cancel-ship
+
+  - name: send_confirmation
+    execute:
+      method: POST
+      url: http://localhost:9090/notify
+      timeout: 5s
+    compensate:
+      method: POST
+      url: http://localhost:9090/notify-cancel
+
+  - name: update_analytics
+    execute:
+      method: POST
+      url: http://localhost:9090/analytics
+      timeout: 5s
+    # No compensate call: an analytics event has nothing meaningful to roll back.

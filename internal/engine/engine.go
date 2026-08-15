@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/srikarjy/workflow_engine/internal/faultinject"
 	"github.com/srikarjy/workflow_engine/internal/idempotency"
+	"github.com/srikarjy/workflow_engine/internal/metrics"
 	"github.com/srikarjy/workflow_engine/internal/queue"
 	"github.com/srikarjy/workflow_engine/internal/saga"
 	"github.com/srikarjy/workflow_engine/internal/store"
@@ -119,7 +121,7 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, wfID uuid.UUID, wfDef *Wor
 			if err != nil {
 				return uuid.Nil, fmt.Errorf("engine: get step output: %w", err)
 			}
-			plan.AddStep(step.Name(), output, dedupKey)
+			plan.AddStep(step.Name(), output, dedupKey, step.Compensate)
 			stepInputs = output
 			continue
 		}
@@ -139,16 +141,20 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, wfID uuid.UUID, wfDef *Wor
 				if err != nil {
 					return uuid.Nil, err
 				}
-				plan.AddStep(step.Name(), output, dedupKey)
+				plan.AddStep(step.Name(), output, dedupKey, step.Compensate)
 				stepInputs = output
 				continue
 			}
 			return uuid.Nil, fmt.Errorf("engine: record step started: %w", err)
 		}
+		metrics.StepsStarted.WithLabelValues(step.Name()).Inc()
 
 		// Execute step business logic
+		start := time.Now()
 		output, err := step.Execute(ctx, stepInputs)
+		metrics.StepDuration.WithLabelValues(step.Name()).Observe(time.Since(start).Seconds())
 		if err != nil {
+			metrics.StepsFailed.WithLabelValues(step.Name()).Inc()
 			// Record failure
 			_, _ = e.store.AppendEvent(ctx, store.Event{
 				WorkflowID: wfID,
@@ -182,8 +188,9 @@ func (e *Engine) ExecuteWorkflow(ctx context.Context, wfID uuid.UUID, wfDef *Wor
 				return uuid.Nil, fmt.Errorf("engine: record step completed: %w", err)
 			}
 		}
+		metrics.StepsCompleted.WithLabelValues(step.Name()).Inc()
 
-		plan.AddStep(step.Name(), output, dedupKey)
+		plan.AddStep(step.Name(), output, dedupKey, step.Compensate)
 		stepInputs = output
 	}
 
@@ -222,6 +229,7 @@ func (e *Engine) ProcessStep(ctx context.Context, msg queue.StepMessage) error {
 	}
 	if completed {
 		log.Printf("worker %s: step %s already completed (dedup: %s)", e.workerID, msg.StepName, dedupKey)
+		metrics.StepsSkippedDuplicate.WithLabelValues(msg.StepName).Inc()
 		return nil
 	}
 
@@ -250,11 +258,15 @@ func (e *Engine) ProcessStep(ctx context.Context, msg queue.StepMessage) error {
 		}
 		return fmt.Errorf("engine: record step started: %w", err)
 	}
+	metrics.StepsStarted.WithLabelValues(msg.StepName).Inc()
 
 	faultinject.Crash("before_execution")
 
+	start := time.Now()
 	output, execErr := step.Execute(ctx, msg.Input)
+	metrics.StepDuration.WithLabelValues(msg.StepName).Observe(time.Since(start).Seconds())
 	if execErr != nil {
+		metrics.StepsFailed.WithLabelValues(msg.StepName).Inc()
 		_, _ = e.store.AppendEvent(ctx, store.Event{
 			WorkflowID: wfID,
 			StepName:   msg.StepName,
@@ -277,6 +289,7 @@ func (e *Engine) ProcessStep(ctx context.Context, msg queue.StepMessage) error {
 	if err != nil && !errors.Is(err, store.ErrDuplicateEvent) {
 		return fmt.Errorf("engine: record step completed: %w", err)
 	}
+	metrics.StepsCompleted.WithLabelValues(msg.StepName).Inc()
 
 	log.Printf("worker %s: step %s completed (dedup: %s)", e.workerID, msg.StepName, dedupKey)
 	return nil
